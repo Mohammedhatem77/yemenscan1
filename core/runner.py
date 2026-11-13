@@ -147,6 +147,8 @@ def run_docker_tool(
     # run it directly for maximum performance and avoid container overhead.
     tool_binary = image.split("/")[-1].split(":")[0]
     local_bin = shutil.which(tool_binary) or shutil.which(f"{tool_binary}.exe")
+    if not local_bin and "kiterunner" in tool_binary:
+        local_bin = shutil.which("kr") or shutil.which("kr.exe")
     prefer_local = os.getenv("PREFER_LOCAL_TOOLS", "true").lower() in ("true", "1", "yes")
 
     if local_bin and (prefer_local or not is_docker_available()):
