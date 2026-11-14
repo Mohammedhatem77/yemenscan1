@@ -13,11 +13,11 @@ _CANCELLED_SCANS: Set[str] = set()
 _LOCK = threading.Lock()
 
 def get_docker_cmd() -> str:
-    """Finds the absolute path to docker executable, prioritizing docker.exe on Windows."""
+    """Finds the docker executable path, prioritizing native environment CLI."""
     for p in [
+        shutil.which("docker"),
         r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
         shutil.which("docker.exe"),
-        shutil.which("docker")
     ]:
         if p and os.path.exists(p) and not os.path.isdir(p):
             return p
@@ -84,14 +84,20 @@ def clear_scan_cancelled(scan_id: str) -> None:
 
 import time
 
-# Automatically ensure local tools/ directory is in PATH for direct high-speed execution
-_TOOLS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "tools"))
-if os.path.exists(_TOOLS_DIR) and _TOOLS_DIR not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = f"{_TOOLS_DIR}{os.pathsep}{os.environ.get('PATH', '')}"
-
 def get_docker_volume_path(local_path: str) -> str:
-    """Converts a local Windows path to a format compatible with Docker -v flag."""
+    """
+    Translates directory path for Docker volume mounting.
+    Supports DooD (Docker-outside-of-Docker) where container mounts are mapped
+    to the host project directory via HOST_PROJECT_DIR.
+    """
     abs_path = os.path.abspath(local_path).replace("\\", "/")
+    host_project_dir = os.getenv("HOST_PROJECT_DIR", "").strip()
+
+    if host_project_dir and abs_path.startswith("/app"):
+        clean_host = host_project_dir.replace("\\", "/").rstrip("/")
+        rel_path = abs_path[len("/app"):].lstrip("/")
+        return f"{clean_host}/{rel_path}"
+
     return abs_path
 
 _DOCKER_AVAILABLE_CACHE: Optional[bool] = None
@@ -153,27 +159,26 @@ def run_docker_tool(
     if scan_id and is_scan_cancelled(scan_id):
         raise ScanCancelledException(f"Scan {scan_id} has been cancelled by user.")
 
-    # 1. Native/Bundled Tool Execution Check:
-    # Docker containers are the primary execution mode (isolated & reproducible).
-    # If Docker is unavailable (or PREFER_LOCAL_TOOLS=true is explicitly set),
-    # fall back to local binary if present in PATH.
+    # 1. Primary Execution Mode: Isolated Docker Containers (DooD)
+    # Enforces ephemeral sandbox execution. Local binary is only used if developer explicitly sets PREFER_LOCAL_TOOLS=true.
     tool_binary = image.split("/")[-1].split(":")[0]
-    local_bin = shutil.which(tool_binary) or shutil.which(f"{tool_binary}.exe")
     prefer_local = os.getenv("PREFER_LOCAL_TOOLS", "false").lower() in ("true", "1", "yes")
 
-    if local_bin and (prefer_local or not is_docker_available()):
-        local_args = []
-        for arg in args:
-            translated = arg.replace(container_mount, volume_dir)
-            if extra_volumes:
-                for host_p, cont_p in extra_volumes:
-                    translated = translated.replace(cont_p, host_p)
-            local_args.append(translated)
-        return run_local_tool([local_bin] + local_args, cwd=volume_dir, timeout=timeout, scan_id=scan_id)
+    if prefer_local:
+        local_bin = shutil.which(tool_binary) or shutil.which(f"{tool_binary}.exe")
+        if local_bin:
+            local_args = []
+            for arg in args:
+                translated = arg.replace(container_mount, volume_dir)
+                if extra_volumes:
+                    for host_p, cont_p in extra_volumes:
+                        translated = translated.replace(cont_p, host_p)
+                local_args.append(translated)
+            return run_local_tool([local_bin] + local_args, cwd=volume_dir, timeout=timeout, scan_id=scan_id)
 
-    # If Docker cannot actually run containers on this system, exit immediately with false
+    # 2. Strict Docker Execution
     if not is_docker_available():
-        return False, "Docker is not available or unable to run containers on this host system."
+        return False, "محرك Docker غير متاح أو لا يمتلك صلاحية تشغيل الحاويات المعزولة."
 
     vol_path = get_docker_volume_path(volume_dir)
     cmd = [get_docker_cmd(), "run", "--rm"]
