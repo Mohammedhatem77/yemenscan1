@@ -326,9 +326,9 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
             seen_targets.add(norm)
             valid_targets.append(norm)
 
-    # Write naabu_targets.txt strictly from current valid targets
+    # Write naabu_targets.txt strictly from current valid targets (using newline="\n" for Linux Docker compatibility)
     if valid_targets:
-        with open(naabu_targets_file, "w", encoding="utf-8") as f:
+        with open(naabu_targets_file, "w", encoding="utf-8", newline="\n") as f:
             for t in valid_targets:
                 f.write(f"{t}\n")
     else:

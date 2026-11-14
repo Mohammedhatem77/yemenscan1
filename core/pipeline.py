@@ -58,7 +58,7 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
         naabu_targets = [clean_domain] + [s for s in subdomains if s.lower() != clean_domain]
         naabu_targets_file = os.path.join(session_dir, "naabu_targets.txt")
         try:
-            with open(naabu_targets_file, "w", encoding="utf-8") as f:
+            with open(naabu_targets_file, "w", encoding="utf-8", newline="\n") as f:
                 for t in naabu_targets:
                     f.write(f"{t}\n")
         except Exception:
