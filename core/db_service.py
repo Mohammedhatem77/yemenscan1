@@ -243,6 +243,7 @@ def save_discovered_assets(
                     "path": item.get("path"),
                     "status_code": status_code,
                     "content_type": item.get("content_type"),
+                    "content_length": item.get("content_length", 0),
                     "is_swagger_or_doc": item.get("is_swagger_or_doc", False),
                     "is_auth_endpoint": item.get("is_auth_endpoint", False),
                     "is_actuator": item.get("is_actuator", False),
