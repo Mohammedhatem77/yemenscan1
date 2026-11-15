@@ -8,18 +8,19 @@ echo.
 
 cd /d "%~dp0"
 
-:: 1. Terminate FastAPI backend server on port 8000
+:: 1. Terminate FastAPI backend server and its window on port 8000
 echo [*] [1/2] Stopping FastAPI Web Server on port 8000...
 for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8000 ^| findstr LISTENING') do (
-    taskkill /F /PID %%a >nul 2>&1
+    taskkill /F /T /PID %%a >nul 2>&1
 )
 
 :: 2. Stop Docker Containers cleanly
 echo [*] [2/2] Stopping PostgreSQL container in Docker...
-docker compose down
+docker compose down >nul 2>&1
 
 echo.
 echo ========================================================
 echo  [+] All YemenScan services have been stopped cleanly!
 echo ========================================================
 ping 127.0.0.1 -n 3 >nul
+exit
