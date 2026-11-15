@@ -18,11 +18,77 @@ from core.stage3_vulnerabilities import (
     NUCLEI_DOCKER_IMAGE,
     WAPITI_DOCKER_IMAGE
 )
+from core.scope_classifier import load_scoped_urls
 from database import SessionLocal
 from core.db_service import ingest_scan_from_directory, complete_scan_session
 
 STANDALONE_DIR = os.path.join(SCANS_DIR, "_standalone")
 os.makedirs(STANDALONE_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Scope Guard — Nuclei Takeover Helper
+# ---------------------------------------------------------------------------
+_NUCLEI_TAKEOVER_IMAGE = (
+    "projectdiscovery/nuclei:v3.11.1"
+    "@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb"
+)
+
+def _run_nuclei_takeover_check(
+    session_dir: str,
+    scan_id: Optional[str],
+    third_party_urls: List[str]
+) -> Tuple[bool, List[Dict[str, Any]]]:
+    """
+    Lightweight Nuclei Takeover-only check for third-party / external-redirect assets.
+    Uses -tags takeover -severity critical,high,medium — passive single-GET check.
+    Keeps zero dependency on stage3_vulnerabilities internals (safe from teammate conflict).
+    """
+    if not third_party_urls:
+        return True, []
+
+    takeover_txt = os.path.join(session_dir, "nuclei_takeover_targets.txt")
+    with open(takeover_txt, "w", encoding="utf-8") as fh:
+        for u in third_party_urls:
+            fh.write(f"{u}\n")
+
+    out_file = os.path.join(session_dir, "nuclei_takeover_findings.jsonl")
+    container_input  = "/nuclei_input/takeover_targets.txt"
+    container_output = "/nuclei_input/takeover_findings.jsonl"
+
+    docker_args = [
+        "run", "--rm",
+        "-v", f"{session_dir}:/nuclei_input",
+        _NUCLEI_TAKEOVER_IMAGE,
+        "-l", container_input,
+        "-tags", "takeover",
+        "-severity", "critical,high,medium",
+        "-je", container_output,
+        "-silent",
+        "-no-color",
+    ]
+
+    findings: List[Dict[str, Any]] = []
+    try:
+        ok, stdout, stderr = run_docker_tool(docker_args, timeout=300)
+        if os.path.exists(out_file):
+            with open(out_file, "r", encoding="utf-8", errors="replace") as rf:
+                for line in rf:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rec = json.loads(line)
+                            rec.setdefault("source", "nuclei-takeover")
+                            findings.append(rec)
+                        except Exception:
+                            pass
+        print(
+            f"[Scope Guard] ✅ Nuclei Takeover: وجد {len(findings)} ثغرة محتملة في الأصول الخارجية.",
+            flush=True
+        )
+        return ok, findings
+    except Exception as exc:
+        print(f"[Scope Guard] ⚠️ Nuclei Takeover فشل: {exc}", flush=True)
+        return False, []
 
 # ---------------------------------------------------------------------------
 # 1. Pipeline Stages Execution (المراحل الثلاث لخط الفحص)
@@ -140,6 +206,8 @@ def run_stage2_pipeline(scan_id: str) -> Dict[str, Any]:
 def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
     """
     Executes Stage 3 (Vulnerability Assessment): Nuclei (CVE/OWASP) + Wapiti (DAST).
+    Applies Scope Guard: third-party assets are excluded from full DAST
+    but are still passed to Nuclei with the 'takeover' tag only.
     Unifies findings and updates database.
     """
     session_dir = get_session_dir(scan_id)
@@ -154,25 +222,71 @@ def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
         log_message="تشغيل المرحلة الثالثة (Nuclei + Wapiti) لفحص الثغرات الأمنية..."
     )
 
-    all_targets = prepare_nuclei_targets(session_dir)
+    # ── Scope Guard: تقسيم الأصول حسب نطاق الفحص ───────────────────────────
+    scoped = load_scoped_urls(session_dir)
+    in_scope_urls    = scoped["in_scope_urls"]
+    third_party_urls = scoped["third_party_urls"]
+    excluded_count   = scoped["excluded_count"]
 
-    # 1. Nuclei
-    nuclei_findings = []
-    if all_targets:
-        ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+    if excluded_count > 0:
+        print(
+            f"[Scope Guard] ✅ تم استبعاد {excluded_count} أصل تابع لطرف ثالث من فحص DAST الكامل.",
+            flush=True
+        )
+        print(
+            f"[Scope Guard] 🔍 سيتم فحص {excluded_count} أصل بـ Nuclei (Takeover فقط) كفحص سلبي.",
+            flush=True
+        )
 
-    # 2. Wapiti
-    active_urls = []
-    active_urls_file = os.path.join(session_dir, "active_urls.txt")
-    if os.path.exists(active_urls_file):
-        with open(active_urls_file, "r", encoding="utf-8") as f:
-            active_urls = [line.strip() for line in f if line.strip()]
+    # ── 1. Nuclei — فحص CVE/OWASP على الأصول الداخلية فقط ──────────────────
+    nuclei_findings: List[Dict[str, Any]] = []
 
-    wapiti_findings = []
-    if active_urls:
-        ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, active_urls)
+    if in_scope_urls:
+        # نستخدم prepare_nuclei_targets لاستخراج الأصول وكتابة nuclei_targets.txt
+        # (تعمل على active_urls.txt وactive_urls.json — كلاهما يحتوي الكل)
+        # ثم نُرشّح ملف nuclei_targets.txt ليحتوي فقط الأصول الداخلية
+        all_targets = prepare_nuclei_targets(session_dir)
+        # تصفية: احتفظ فقط بالأصول التي URL أصولها تتطابق مع in_scope_urls
+        in_scope_origins = set()
+        for u in in_scope_urls:
+            parsed = urlparse(u)
+            origin = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme else u
+            in_scope_origins.add(origin.rstrip("/"))
+        filtered_targets = [t for t in all_targets if any(t.startswith(o) or o.startswith(t) for o in in_scope_origins)]
+        if not filtered_targets:
+            filtered_targets = all_targets  # Fallback: في حال التصفية محو الكل
+        # أعد كتابة nuclei_targets.txt بالأصول الداخلية فقط
+        nuclei_txt = os.path.join(session_dir, "nuclei_targets.txt")
+        with open(nuclei_txt, "w", encoding="utf-8") as fh:
+            for t in filtered_targets:
+                fh.write(f"{t}\n")
+        if filtered_targets:
+            ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+    else:
+        print("[Scope Guard] ⚠️ لا توجد أصول داخلية — تخطي فحص Nuclei CVE.", flush=True)
 
-    # 3. Unify Findings
+    # ── 2. Nuclei — فحص Subdomain Takeover على الأصول التابعة لطرف ثالث ─────
+    takeover_findings: List[Dict[str, Any]] = []
+
+    if third_party_urls:
+        print(
+            f"[Scope Guard] 🎯 تشغيل Nuclei Takeover على {len(third_party_urls)} نطاق تابع لطرف ثالث...",
+            flush=True
+        )
+        ok_tak, takeover_findings = _run_nuclei_takeover_check(
+            session_dir, scan_id, third_party_urls
+        )
+        nuclei_findings = nuclei_findings + takeover_findings
+
+    # ── 3. Wapiti DAST — على الأصول الداخلية فقط ────────────────────────────
+    wapiti_findings: List[Dict[str, Any]] = []
+
+    if in_scope_urls:
+        ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, in_scope_urls)
+    else:
+        print("[Scope Guard] ⚠️ لا توجد أصول داخلية — تخطي فحص Wapiti DAST.", flush=True)
+
+    # ── 4. توحيد النتائج وحفظها ──────────────────────────────────────────────
     unify_and_save_vulnerabilities(session_dir, scan_id, nuclei_findings, wapiti_findings)
 
     # Ingest to DB
@@ -183,13 +297,19 @@ def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
     except Exception as e:
         print(f"[!] Warning: DB ingestion error after stage 3: {e}", flush=True)
 
+    total_vulns = len(nuclei_findings) + len(wapiti_findings)
     update_status(
         scan_id,
         status="completed",
         stage="completed",
         progress=100,
         is_completed=True,
-        log_message=f"اكتملت المرحلة الثالثة: اكتشاف {len(nuclei_findings)} ثغرة عبر Nuclei و {len(wapiti_findings)} ثغرة عبر Wapiti."
+        log_message=(
+            f"اكتملت المرحلة الثالثة: {len(nuclei_findings)} ثغرة عبر Nuclei "
+            f"(منها {len(takeover_findings)} Takeover) "
+            f"و {len(wapiti_findings)} ثغرة عبر Wapiti. "
+            f"تم استبعاد {excluded_count} أصل تابع لطرف ثالث من DAST."
+        )
     )
 
     return {
@@ -197,8 +317,14 @@ def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
         "scan_id": scan_id,
         "stage": "stage3_vulnerabilities",
         "nuclei_findings_count": len(nuclei_findings),
+        "nuclei_takeover_count": len(takeover_findings),
         "wapiti_findings_count": len(wapiti_findings),
-        "total_vulnerabilities": len(nuclei_findings) + len(wapiti_findings)
+        "total_vulnerabilities": total_vulns,
+        "scope_guard": {
+            "in_scope_count": scoped["in_scope_count"],
+            "third_party_count": scoped["third_party_count"],
+            "excluded_from_dast": excluded_count,
+        }
     }
 
 
@@ -246,27 +372,68 @@ def run_tool_in_session(scan_id: str, tool_name: str, options: Optional[Dict[str
     elif tool_lower == "kiterunner":
         active_urls = options.get("urls")
         if not active_urls:
-            urls_file = os.path.join(session_dir, "active_urls.txt")
-            if os.path.exists(urls_file):
-                with open(urls_file, "r", encoding="utf-8") as f:
-                    active_urls = [line.strip() for line in f if line.strip()]
+            # ── Scope Guard: استخدم الأصول الداخلية فقط ──
+            scoped = load_scoped_urls(session_dir)
+            active_urls = scoped["in_scope_urls"]
+            if scoped["excluded_count"] > 0:
+                print(
+                    f"[Scope Guard] Kiterunner: استبعاد {scoped['excluded_count']} "
+                    f"أصل تابع لطرف ثالث — الفحص على {scoped['in_scope_count']} أصل داخلي فقط.",
+                    flush=True
+                )
         if not active_urls:
             return {"tool": "kiterunner", "status": "skipped", "message": "No active URLs found to probe APIs.", "count": 0}
         ok, api_endpoints = run_kiterunner_or_api_probing(active_urls, session_dir, scan_id)
         return {"tool": "kiterunner", "status": "success" if ok else "failed", "api_endpoints": api_endpoints, "count": len(api_endpoints)}
 
     elif tool_lower == "nuclei":
-        prepare_nuclei_targets(session_dir)
-        ok, findings = run_nuclei(session_dir, scan_id)
-        return {"tool": "nuclei", "status": "success" if ok else "failed", "findings": findings, "count": len(findings)}
+        # ── Scope Guard: فحص CVE على الداخلي، Takeover على الطرف الثالث ──
+        scoped = load_scoped_urls(session_dir)
+        in_scope_urls    = scoped["in_scope_urls"]
+        third_party_urls = scoped["third_party_urls"]
+        if scoped["excluded_count"] > 0:
+            print(
+                f"[Scope Guard] Nuclei: استبعاد {scoped['excluded_count']} أصل من فحص CVE. "
+                f"سيُفحص {scoped['third_party_count']} منها بـ Takeover فقط.",
+                flush=True
+            )
+
+        all_findings: List[Dict[str, Any]] = []
+        # فحص CVE/OWASP على الأصول الداخلية
+        if in_scope_urls:
+            prepare_nuclei_targets(session_dir)
+            ok_nuc, cve_findings = run_nuclei(session_dir, scan_id)
+            all_findings.extend(cve_findings)
+        # فحص Takeover على الطرف الثالث
+        if third_party_urls:
+            ok_tak, tak_findings = _run_nuclei_takeover_check(
+                session_dir, scan_id, third_party_urls
+            )
+            all_findings.extend(tak_findings)
+
+        return {
+            "tool": "nuclei",
+            "status": "success",
+            "findings": all_findings,
+            "count": len(all_findings),
+            "scope_guard": {
+                "in_scope_count": scoped["in_scope_count"],
+                "third_party_takeover_count": scoped["third_party_count"],
+            }
+        }
 
     elif tool_lower == "wapiti":
         active_urls = options.get("urls")
         if not active_urls:
-            urls_file = os.path.join(session_dir, "active_urls.txt")
-            if os.path.exists(urls_file):
-                with open(urls_file, "r", encoding="utf-8") as f:
-                    active_urls = [line.strip() for line in f if line.strip()]
+            # ── Scope Guard: استخدم الأصول الداخلية فقط ──
+            scoped = load_scoped_urls(session_dir)
+            active_urls = scoped["in_scope_urls"]
+            if scoped["excluded_count"] > 0:
+                print(
+                    f"[Scope Guard] Wapiti: استبعاد {scoped['excluded_count']} "
+                    f"أصل تابع لطرف ثالث — DAST على {scoped['in_scope_count']} أصل داخلي فقط.",
+                    flush=True
+                )
         if not active_urls:
             return {"tool": "wapiti", "status": "skipped", "message": "No active URLs found for Wapiti DAST.", "count": 0}
         ok, findings = run_wapiti_dast(session_dir, scan_id, active_urls)

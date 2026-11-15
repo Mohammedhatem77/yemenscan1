@@ -1,4 +1,6 @@
 import re
+import os
+import json
 from urllib.parse import urlsplit, urljoin
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -243,4 +245,79 @@ def classify_scope(
         "redirect_type": redirect_type,
         "redirect_url": target_redirect_url,
         "scope_tag": scope_tag
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scope-Aware URL Loader (للاستخدام في Stage 3 Scope Guard)
+# ---------------------------------------------------------------------------
+
+def load_scoped_urls(session_dir: str) -> Dict[str, List[str]]:
+    """
+    Reads active_urls.json from the session directory and partitions URLs
+    by scope_tag into three buckets used by the Stage 3 Scope Guard:
+
+    - in_scope_urls     : scope_tag == "in_scope_full"
+                          → safe for all DAST tools (Nuclei CVE, Wapiti, Kiterunner)
+    - third_party_urls  : scope_tag in ("third_party_passive", "external_redirect")
+                          → allowed ONLY for Nuclei Subdomain-Takeover passive check
+    - all_urls          : every URL found regardless of scope
+
+    Falls back to active_urls.txt (plain list, treated as in_scope_full)
+    if the JSON file is not found or contains no scope_tag data.
+
+    Returns a dict with keys: 'in_scope_urls', 'third_party_urls', 'all_urls',
+    'excluded_count', 'in_scope_count', 'third_party_count'.
+    """
+    in_scope: List[str] = []
+    third_party: List[str] = []
+    all_urls: List[str] = []
+
+    json_path = os.path.join(session_dir, "active_urls.json")
+    txt_path  = os.path.join(session_dir, "active_urls.txt")
+
+    # ── Primary: read from active_urls.json (has scope metadata) ────────────
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8", errors="replace") as fh:
+                for raw_line in fh:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        rec = json.loads(raw_line)
+                        url = str(rec.get("url") or rec.get("input") or "").strip()
+                        if not url:
+                            continue
+                        all_urls.append(url)
+                        tag = str(rec.get("scope_tag") or "").strip()
+                        if tag in ("third_party_passive", "external_redirect"):
+                            third_party.append(url)
+                        else:
+                            # "in_scope_full" or missing/unknown tag → treat as in-scope
+                            in_scope.append(url)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # ── Fallback: active_urls.txt has no scope metadata → all in-scope ──────
+    if not all_urls and os.path.exists(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    url = line.strip()
+                    if url:
+                        all_urls.append(url)
+                        in_scope.append(url)
+        except Exception:
+            pass
+
+    return {
+        "in_scope_urls":    in_scope,
+        "third_party_urls": third_party,
+        "all_urls":         all_urls,
+        "in_scope_count":   len(in_scope),
+        "third_party_count": len(third_party),
+        "excluded_count":   len(third_party),
     }
