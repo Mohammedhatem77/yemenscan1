@@ -930,13 +930,25 @@ def get_endpoints_results(scan_id: str, db: Session = Depends(get_db)):
     active_urls = prioritize_dict_records(active_urls, target_domain, key="url")
     api_endpoints = prioritize_dict_records(api_endpoints, target_domain, key="url")
 
+    diagnostic_reason = ""
+    session_dir = get_session_dir(scan_id)
+    if os.path.exists(session_dir):
+        meta_file = os.path.join(session_dir, "kiterunner_metadata.json")
+        if os.path.exists(meta_file):
+            try:
+                with open(meta_file, "r", encoding="utf-8") as mf:
+                    diagnostic_reason = json.load(mf).get("diagnostic_reason", "")
+            except Exception:
+                pass
+
     return {
         "status": "success",
         "scan_id": scan_id,
         "total_live_urls": len(active_urls),
         "live_web_services": active_urls,
         "total_api_endpoints": len(api_endpoints),
-        "api_endpoints": api_endpoints
+        "api_endpoints": api_endpoints,
+        "diagnostic_reason": diagnostic_reason
     }
 
 @app.get("/api/scans/{scan_id}/report", include_in_schema=False)
