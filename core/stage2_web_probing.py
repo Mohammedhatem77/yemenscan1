@@ -171,8 +171,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         )
         return True, [], []
 
-    # Write httpx_input.txt strictly from valid_inputs
-    with open(httpx_input_file, "w", encoding="utf-8") as f:
+    # Write httpx_input.txt strictly from valid_inputs (using newline="\n" for Linux Docker compatibility)
+    with open(httpx_input_file, "w", encoding="utf-8", newline="\n") as f:
         for inp in valid_inputs:
             f.write(f"{inp}\n")
 
@@ -541,6 +541,112 @@ def normalize_endpoint_url(raw_url: str) -> Optional[Tuple[str, str, Tuple[str, 
     except Exception:
         return None
 
+def filter_spurious_api_endpoints(
+    valid_endpoints: List[Dict[str, Any]]
+) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
+    """
+    Heuristically analyzes and purifies discovered Kiterunner API candidate endpoints:
+    1. Filters out root paths (path == '/' or empty) which are homepage/hosting defaults (cPanel default landing pages).
+    2. Clusters responses per Origin to detect SPA Wildcard / Soft-404 Fallback behavior (e.g. Vercel/Firebase/React returning identical length for hundreds of paths).
+    3. Filters out mass generic redirects (HTTP 308/301) lacking API payloads.
+    4. Automatically determines human-readable technical diagnostics (diagnostic_reason) explaining why zero endpoints were found when filtered.
+    
+    Returns:
+        (filtered_endpoints, diagnostic_reason, filter_stats)
+    """
+    if not valid_endpoints:
+        return [], "لم يستجب السيرفر لأي من مسارات الـ APIs في القاموس، أو أن الموقع محمي ولا يتيح واجهات برمجية عامة.", {
+            "initial_count": 0,
+            "root_path_filtered": 0,
+            "wildcard_filtered": 0,
+            "redirect_filtered": 0,
+            "kept_count": 0
+        }
+
+    from collections import Counter
+    root_filtered = 0
+    redirect_filtered = 0
+    wildcard_filtered = 0
+    non_root_candidates: List[Dict[str, Any]] = []
+
+    # 1. First pass: Filter root path entries (path == '/' or empty)
+    for ep in valid_endpoints:
+        p = (ep.get("path") or "").strip()
+        if p in ("/", ""):
+            root_filtered += 1
+            continue
+        non_root_candidates.append(ep)
+
+    # If all were root paths (e.g., cPanel defaults where only '/' returned 200)
+    if not non_root_candidates:
+        diagnostic = "تم فحص النطاقات وتصفية استجابات لوحة الاستضافة الافتراضية (cPanel Default Landing Pages) على مسار الجذر /. لا توجد مسارات APIs برمجية مكشوفة."
+        return [], diagnostic, {
+            "initial_count": len(valid_endpoints),
+            "root_path_filtered": root_filtered,
+            "wildcard_filtered": 0,
+            "redirect_filtered": 0,
+            "kept_count": 0
+        }
+
+    # 2. Second pass: Group non-root candidates by origin to detect Wildcard / SPA Fallback clusters
+    origin_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for ep in non_root_candidates:
+        orig = ep.get("origin") or "default"
+        origin_groups.setdefault(orig, []).append(ep)
+
+    final_kept: List[Dict[str, Any]] = []
+    spa_detected = False
+    redirect_detected = False
+
+    for orig, eps in origin_groups.items():
+        total_for_orig = len(eps)
+        
+        # If an origin has >= 8 candidate endpoints, detect uniform response clusters
+        if total_for_orig >= 8:
+            cluster_counts = Counter((e.get("content_length"), e.get("status_code")) for e in eps)
+            # Any cluster appearing >= 8 times is a wildcard/default response
+            wildcard_keys = {k for k, count in cluster_counts.items() if count >= 8}
+            
+            # Also generic 301/308 redirects appearing >= 5 times
+            redirect_counts = Counter(e.get("status_code") for e in eps)
+            mass_redirect = {sc for sc, count in redirect_counts.items() if sc in (301, 308) and count >= 5}
+            
+            for e in eps:
+                k = (e.get("content_length"), e.get("status_code"))
+                if k in wildcard_keys:
+                    wildcard_filtered += 1
+                    spa_detected = True
+                elif e.get("status_code") in mass_redirect:
+                    redirect_filtered += 1
+                    redirect_detected = True
+                else:
+                    final_kept.append(e)
+        else:
+            # Small origin with few endpoints: preserve them
+            final_kept.extend(eps)
+
+    # 3. Determine diagnostic reason if final_kept is empty
+    diagnostic_reason = ""
+    if not final_kept:
+        if spa_detected or wildcard_filtered > 0:
+            diagnostic_reason = "الموقع يعتمد معمارية Single Page Application (SPA / Serverless)؛ تم الكشف الاستباقي عن آلية (SPA Fallback) وتصفية كافة الاستجابات الوهمية المتطابقة مع صفحة الواجهة. تم التأكد من عدم وجود أي واجهات API مكشوفة."
+        elif redirect_detected or redirect_filtered > 0:
+            diagnostic_reason = "تم فحص النطاقات وتصفية عمليات إعادة التوجيه العامة (308/301 Redirects) لعدم احتوائها على مسارات برمجية."
+        elif root_filtered > 0:
+            diagnostic_reason = "تم فحص النطاقات وتصفية استجابات لوحة الاستضافة الافتراضية (cPanel Default Landing Pages) على مسار الجذر /. لا توجد مسارات APIs برمجية مكشوفة."
+        else:
+            diagnostic_reason = "لم يتم العثور على أي واجهات API معلنة أو مكشوفة."
+
+    stats = {
+        "initial_count": len(valid_endpoints),
+        "root_path_filtered": root_filtered,
+        "wildcard_filtered": wildcard_filtered,
+        "redirect_filtered": redirect_filtered,
+        "kept_count": len(final_kept)
+    }
+
+    return final_kept, diagnostic_reason, stats
+
 def run_kiterunner_or_api_probing(
     active_urls: List[str],
     session_dir: str,
@@ -721,8 +827,8 @@ def run_kiterunner_or_api_probing(
         pruned_sorted = sorted(deduped, key=_api_target_score)
         targets_for_scan = pruned_sorted[:10]
 
-    # Write normalized input file for Kiterunner
-    with open(kiterunner_input_file, "w", encoding="utf-8") as f:
+    # Write normalized input file for Kiterunner (using newline="\n" for Linux Docker compatibility)
+    with open(kiterunner_input_file, "w", encoding="utf-8", newline="\n") as f:
         for inp in targets_for_scan:
             f.write(f"{inp}\n")
 
@@ -987,7 +1093,6 @@ def run_kiterunner_or_api_probing(
             status_code_counts[sc_str] = status_code_counts.get(sc_str, 0) + 1
 
     valid_count = len(valid_endpoints)
-    candidate_count = valid_count
     unique_origin_count = len(set(ep["origin"] for ep in valid_endpoints))
 
     # Invariants verification
@@ -998,17 +1103,21 @@ def run_kiterunner_or_api_probing(
         f"Response invariant violation: responses={response_record_count} != valid={valid_count} + invalid_resp={invalid_response_count} + dup={duplicate_count}"
     )
 
+    # Heuristic smart filtering to eliminate spurious root paths, cPanel defaults, and SPA wildcard fallbacks
+    filtered_endpoints, diagnostic_reason, filter_stats = filter_spurious_api_endpoints(valid_endpoints)
+    candidate_count = len(filtered_endpoints)
+
     # Prioritize primary entered target at top of output lists without fabricating new URLs
     stat = get_status(scan_id) or {}
     dom = stat.get("target_domain", "")
-    valid_endpoints = prioritize_dict_records(valid_endpoints, dom, key="url")
+    filtered_endpoints = prioritize_dict_records(filtered_endpoints, dom, key="url")
 
     # Save discovered API endpoints
     with open(api_endpoints_json, "w", encoding="utf-8") as f:
-        json.dump(valid_endpoints, f, ensure_ascii=False, indent=2)
+        json.dump(filtered_endpoints, f, ensure_ascii=False, indent=2)
 
     with open(api_endpoints_file, "w", encoding="utf-8") as f:
-        for ep in valid_endpoints:
+        for ep in filtered_endpoints:
             f.write(f"{ep['url']}\n")
 
     # Save metadata
@@ -1024,6 +1133,8 @@ def run_kiterunner_or_api_probing(
         "invalid_response_count": invalid_response_count,
         "duplicate_count": duplicate_count,
         "candidate_count": candidate_count,
+        "diagnostic_reason": diagnostic_reason,
+        "filter_stats": filter_stats,
         "unique_origin_count": unique_origin_count,
         "methods": methods_count,
         "status_code_counts": status_code_counts,
@@ -1042,16 +1153,19 @@ def run_kiterunner_or_api_probing(
         pass
 
     # Print discovered route candidates directly to stdout
-    for ep in valid_endpoints:
+    for ep in filtered_endpoints:
         print(f"{ep['method']} {ep['url']} [{ep['status_code']}]", flush=True)
-    if valid_endpoints:
+    if filtered_endpoints:
         print("", flush=True)
 
     if candidate_count > 0:
-        log_msg = f"اكتمل استكشاف مسارات الـ APIs: تم اكتشاف {candidate_count} مسار API مرشح (API Route Candidates) بواسطة Kiterunner."
+        log_msg = f"اكتمل استكشاف مسارات الـ APIs: تم اكتشاف {candidate_count} مسار API مرشح ومتحقق منه بواسطة Kiterunner."
         tool_status = "success"
     else:
-        log_msg = "اكتمل استكشاف مسارات الـ APIs: لم يتم العثور على أي مسار API بواسطة Kiterunner (0 مسارات)."
+        if diagnostic_reason:
+            log_msg = f"اكتمل استكشاف مسارات الـ APIs: 0 مسارات ({diagnostic_reason})"
+        else:
+            log_msg = "اكتمل استكشاف مسارات الـ APIs: لم يتم العثور على أي مسار API بواسطة Kiterunner (0 مسارات)."
         tool_status = "empty"
 
     update_status(
@@ -1062,4 +1176,4 @@ def run_kiterunner_or_api_probing(
         stats_update={"api_endpoints_count": candidate_count}
     )
 
-    return True, valid_endpoints
+    return True, filtered_endpoints

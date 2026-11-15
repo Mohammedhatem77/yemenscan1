@@ -166,6 +166,8 @@ def run_docker_tool(
 
     if prefer_local:
         local_bin = shutil.which(tool_binary) or shutil.which(f"{tool_binary}.exe")
+        if not local_bin and "kiterunner" in tool_binary:
+            local_bin = shutil.which("kr") or shutil.which("kr.exe")
         if local_bin:
             local_args = []
             for arg in args:

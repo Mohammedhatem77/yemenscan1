@@ -1,5 +1,5 @@
 @echo off
-title YemenScan Platform
+title YemenScan Platform Launcher
 chcp 65001 >nul
 echo ========================================================
 echo          YemenScan Security Platform - Start
@@ -9,44 +9,56 @@ echo.
 :: Change directory to script location
 cd /d "%~dp0"
 
-:: Detect Python executable (venv or system python)
-set PYTHON_CMD=python
-if exist "%~dp0venv\Scripts\python.exe" (
-    set PYTHON_CMD="%~dp0venv\Scripts\python.exe"
+:: 1. Detect Python executable
+set "PYTHON_CMD=python"
+if exist "%~dp0venv\Scripts\python.exe" set "PYTHON_CMD=%~dp0venv\Scripts\python.exe"
+if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_CMD=%~dp0.venv\Scripts\python.exe"
+if "%PYTHON_CMD%"=="python" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        if exist "C:\Python314\python.exe" set "PYTHON_CMD=C:\Python314\python.exe"
+    )
 )
 
-:: 1. Free Port 8000 if occupied by a stale instance
+:: 2. Terminate any previous instance on Port 8000 (closes previous server window)
+echo [*] [1/4] Checking and closing any previous YemenScan instances...
 for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8000 ^| findstr LISTENING') do (
-    taskkill /F /PID %%a >nul 2>&1
+    taskkill /F /T /PID %%a >nul 2>&1
 )
 
-:: 2. Start Docker Container for PostgreSQL
-echo [*] [1/4] Starting PostgreSQL container in Docker...
-docker compose up -d db
-if %ERRORLEVEL% neq 0 (
-    echo [!] Warning: Docker did not start or is not running.
-    echo [!] The platform will automatically fallback to SQLite (yemenscan.db).
+:: 3. Start PostgreSQL container in Docker
+echo [*] [2/4] Starting PostgreSQL container in Docker...
+docker compose up -d db >nul 2>&1
+if errorlevel 1 (
+    echo [!] Note: Docker is not available. Using local SQLite database yemenscan.db
 ) else (
+    echo [+] PostgreSQL container started.
     ping 127.0.0.1 -n 3 >nul
 )
 
-:: 3. Initialize Database and Seed System Settings
-echo [*] [2/4] Checking and initializing database schema...
-%PYTHON_CMD% init_db.py
+:: 4. Initialize Database
+echo [*] [3/4] Initializing database schema...
+call "%PYTHON_CMD%" init_db.py
 
-:: 4. Launch Web Dashboard in Default Browser
-echo [*] [3/4] Launching YemenScan Dashboard in browser...
-ping 127.0.0.1 -n 2 >nul
+:: 5. Launch FastAPI Backend in a Single Dedicated Window
+echo [*] [4/4] Starting FastAPI backend on http://127.0.0.1:8000 ...
+start "YemenScan Server - FastAPI" /d "%~dp0" cmd /c "call "%PYTHON_CMD%" -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload || pause"
+
+:: Wait for server to bind
+echo [*] Waiting for server to initialize...
+ping 127.0.0.1 -n 4 >nul
+
+:: 6. Launch Web Dashboard in Browser
+echo [*] Launching YemenScan Dashboard in browser...
 start http://127.0.0.1:8000
 
-:: 5. Start FastAPI Backend Server via Uvicorn
-echo [*] [4/4] Starting FastAPI backend on http://127.0.0.1:8000 ...
-echo ========================================================
-echo  Platform is LIVE! You can close this window to stop it.
-echo ========================================================
-%PYTHON_CMD% -m uvicorn main:app --host 127.0.0.1 --port 8000
-
 echo.
-echo [*] Web server stopped.
-echo [*] To also stop the background database container, run Stop_YemenScan.bat
-pause
+echo ========================================================
+echo  [+] YemenScan Platform is LIVE!
+echo  - Server Logs: Running in the server console window.
+echo  - Web Dashboard: http://127.0.0.1:8000
+echo  - To stop the platform: Run Stop_YemenScan.bat
+echo ========================================================
+echo.
+ping 127.0.0.1 -n 3 >nul
+exit

@@ -485,9 +485,9 @@ def run_standalone_httpx(targets: List[str]) -> Dict[str, Any]:
     work_dir = os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
-    # Write input targets to ports.txt and httpx_input.txt
+    # Write input targets to ports.txt and httpx_input.txt (using newline="\n" for Linux Docker compatibility)
     ports_file = os.path.join(work_dir, "ports.txt")
-    with open(ports_file, "w", encoding="utf-8") as f:
+    with open(ports_file, "w", encoding="utf-8", newline="\n") as f:
         for t in targets:
             clean = t.strip()
             if clean:

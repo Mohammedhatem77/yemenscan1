@@ -565,7 +565,7 @@ def prepare_nuclei_targets(session_dir: str) -> List[str]:
         final_targets = prioritize_urls(final_targets, clean_dom)
 
     nuclei_targets_file = os.path.join(session_dir, "nuclei_targets.txt")
-    with open(nuclei_targets_file, "w", encoding="utf-8") as f:
+    with open(nuclei_targets_file, "w", encoding="utf-8", newline="\n") as f:
         for t in final_targets:
             f.write(f"{t}\n")
 
