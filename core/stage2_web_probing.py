@@ -186,6 +186,9 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "-content-length",
         "-web-server",
         "-location",
+        "-cname",
+        "-asn",
+        "-cdn",
         "-duc",
         "-timeout", "5",
         "-retries", "1",
@@ -344,6 +347,25 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             status_code_counts[sc_str] = status_code_counts.get(sc_str, 0) + 1
 
         active_urls.append(norm_url)
+        raw_cname = data.get("cname")
+        cname_list: List[str] = []
+        if isinstance(raw_cname, list):
+            cname_list = [str(c).strip().rstrip(".") for c in raw_cname if str(c).strip()]
+        elif isinstance(raw_cname, str) and raw_cname.strip():
+            cname_list = [raw_cname.strip().rstrip(".")]
+
+        raw_asn = data.get("asn") or {}
+        asn_dict: Dict[str, Any] = {}
+        if isinstance(raw_asn, dict):
+            asn_dict = {
+                "as_number": raw_asn.get("as_number"),
+                "as_name": str(raw_asn.get("as_name") or "").strip(),
+                "as_country": str(raw_asn.get("as_country") or "").strip()
+            }
+
+        cdn_val = bool(data.get("cdn"))
+        cdn_name_val = str(data.get("cdn_name") or "").strip()
+
         web_targets.append({
             "url": norm_url,
             "input": data.get("input") or f"{host}:{port}",
@@ -356,6 +378,10 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             "tech": data.get("tech") or [],
             "content_length": data.get("content_length"),
             "location": data.get("location") or None,
+            "cname": cname_list,
+            "asn": asn_dict,
+            "cdn": cdn_val,
+            "cdn_name": cdn_name_val,
             "source": "httpx"
         })
 
