@@ -36,6 +36,7 @@ from core.session import (
 from core.pipeline import run_full_pipeline
 from core.target_validator import validate_target_domain, TargetValidationError
 from core.target_prioritizer import prioritize_hosts, prioritize_ports, prioritize_urls, prioritize_dict_records
+from core.scope_classifier import build_scope_badge
 
 from datetime import datetime
 
@@ -665,7 +666,15 @@ def get_scan_results(scan_id: Optional[str] = None):
             for line in file:
                 if line.strip():
                     try:
-                        results.append(json.loads(line.strip()))
+                        rec = json.loads(line.strip())
+                        if "scope_badge" not in rec:
+                            rec["scope_badge"] = build_scope_badge(
+                                scope_tag=rec.get("scope_tag"),
+                                is_third_party=bool(rec.get("is_third_party", False)),
+                                provider=rec.get("provider"),
+                                redirect_url=rec.get("redirect_url")
+                            )
+                        results.append(rec)
                     except Exception:
                         pass
                         
@@ -673,10 +682,15 @@ def get_scan_results(scan_id: Optional[str] = None):
         target_domain = (stat or {}).get("target_domain", "")
         results = prioritize_dict_records(results, target_domain, key="url")
 
+        in_scope_count = sum(1 for r in results if not r.get("is_third_party"))
+        third_party_count = len(results) - in_scope_count
+
         return {
             "status": "success",
             "scan_id": active_scan_id,
             "total_urls_found": len(results),
+            "in_scope_count": in_scope_count,
+            "third_party_count": third_party_count,
             "data": results
         }
     except Exception as e:
@@ -890,6 +904,19 @@ def get_endpoints_results(scan_id: str, db: Session = Depends(get_db)):
                         "is_actuator": ts.get("is_actuator", False),
                     })
                 else:
+                    scope_tag = ts.get("scope_tag", "in_scope_full")
+                    is_tp = bool(ts.get("is_third_party", False))
+                    provider = ts.get("provider", "Self-Hosted (Local / On-Premise)")
+                    hosting_type = ts.get("hosting_type", "self_hosted")
+                    has_redirect = bool(ts.get("has_redirect", False))
+                    redirect_url = ts.get("redirect_url")
+                    scope_badge = ts.get("scope_badge") or build_scope_badge(
+                        scope_tag=scope_tag,
+                        is_third_party=is_tp,
+                        provider=provider,
+                        redirect_url=redirect_url
+                    )
+
                     active_urls.append({
                         "url": a.url,
                         "status_code": ts.get("status_code", 200),
@@ -898,6 +925,13 @@ def get_endpoints_results(scan_id: str, db: Session = Depends(get_db)):
                         "tech": ts.get("tech", []),
                         "content_length": ts.get("content_length", 0),
                         "host": urlparse(a.url).netloc,
+                        "scope_tag": scope_tag,
+                        "is_third_party": is_tp,
+                        "provider": provider,
+                        "hosting_type": hosting_type,
+                        "has_redirect": has_redirect,
+                        "redirect_url": redirect_url,
+                        "scope_badge": scope_badge
                     })
     except Exception as e:
         print(f"[!] Warning: DB query error in get_endpoints_results: {e}", flush=True)
@@ -913,7 +947,15 @@ def get_endpoints_results(scan_id: str, db: Session = Depends(get_db)):
                 for line in f:
                     if line.strip():
                         try:
-                            active_urls.append(json.loads(line.strip()))
+                            rec = json.loads(line.strip())
+                            if "scope_badge" not in rec:
+                                rec["scope_badge"] = build_scope_badge(
+                                    scope_tag=rec.get("scope_tag"),
+                                    is_third_party=bool(rec.get("is_third_party", False)),
+                                    provider=rec.get("provider"),
+                                    redirect_url=rec.get("redirect_url")
+                                )
+                            active_urls.append(rec)
                         except Exception:
                             pass
 
@@ -930,10 +972,15 @@ def get_endpoints_results(scan_id: str, db: Session = Depends(get_db)):
     active_urls = prioritize_dict_records(active_urls, target_domain, key="url")
     api_endpoints = prioritize_dict_records(api_endpoints, target_domain, key="url")
 
+    in_scope_count = sum(1 for u in active_urls if not u.get("is_third_party"))
+    third_party_count = len(active_urls) - in_scope_count
+
     return {
         "status": "success",
         "scan_id": scan_id,
         "total_live_urls": len(active_urls),
+        "in_scope_count": in_scope_count,
+        "third_party_count": third_party_count,
         "live_web_services": active_urls,
         "total_api_endpoints": len(api_endpoints),
         "api_endpoints": api_endpoints

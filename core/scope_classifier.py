@@ -227,7 +227,7 @@ def classify_scope(
                     break
 
     # -------------------------------------------------------------------------
-    # 3. Scope Tagging for DAST Guard
+    # 3. Scope Tagging for DAST Guard & UI Badges
     # -------------------------------------------------------------------------
     if redirect_type == "external":
         scope_tag = "external_redirect"
@@ -235,6 +235,13 @@ def classify_scope(
         scope_tag = "third_party_passive"
     else:
         scope_tag = "in_scope_full"
+
+    scope_badge = build_scope_badge(
+        scope_tag=scope_tag,
+        is_third_party=is_third_party,
+        provider=provider_name,
+        redirect_url=target_redirect_url
+    )
 
     return {
         "is_third_party": is_third_party,
@@ -244,8 +251,51 @@ def classify_scope(
         "has_redirect": has_redirect,
         "redirect_type": redirect_type,
         "redirect_url": target_redirect_url,
-        "scope_tag": scope_tag
+        "scope_tag": scope_tag,
+        "scope_badge": scope_badge
     }
+
+
+def build_scope_badge(
+    scope_tag: Optional[str] = None,
+    is_third_party: bool = False,
+    provider: Optional[str] = None,
+    redirect_url: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Constructs a visual badge dictionary for dashboard and API presentation.
+    Colors:
+      - green  : In-Scope internal assets (full DAST testing allowed)
+      - orange : Third-party SaaS / Cloud assets (Takeover passive check only)
+      - blue   : External redirection (out of target boundary)
+    """
+    tag = scope_tag or ("third_party_passive" if is_third_party else "in_scope_full")
+    prov = provider or "Self-Hosted"
+
+    if tag == "external_redirect":
+        return {
+            "label": f"External Redirect -> {redirect_url or 'External Domain'}",
+            "color": "blue",
+            "dast_allowed": False,
+            "takeover_checked": True,
+            "description": "يعيد التوجيه لنطاق خارجي - مستبعد من DAST ومفحوص لـ Takeover"
+        }
+    elif is_third_party or tag == "third_party_passive":
+        return {
+            "label": f"Third-Party SaaS ({prov})",
+            "color": "orange",
+            "dast_allowed": False,
+            "takeover_checked": True,
+            "description": f"مستضاف لدى طرف ثالث ({prov}) - مستبعد من DAST ومفحوص لـ Takeover"
+        }
+    else:
+        return {
+            "label": "In-Scope (Full DAST Allowed)",
+            "color": "green",
+            "dast_allowed": True,
+            "takeover_checked": False,
+            "description": "أصل داخلي ضمن نطاق الهدف - مسموح فحص DAST الكامل"
+        }
 
 
 # ---------------------------------------------------------------------------
