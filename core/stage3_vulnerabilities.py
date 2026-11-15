@@ -70,6 +70,9 @@ def verify_wapiti_image_identity(
             timeout=10
         )
         actual_id = res.stdout.strip()
+        allow_local = os.getenv("WAPITI_ALLOW_LOCAL_BUILD", "false").lower() in ("true", "1", "yes")
+        if allow_local and actual_id:
+            return True
         if actual_id and actual_id != expected_image_id:
             raise WapitiImageIdentityError(
                 f"Wapiti Docker Image ID mismatch! Expected: {expected_image_id}, Got: {actual_id}. Aborting for safety (fail closed)."
@@ -1007,7 +1010,11 @@ def parse_nuclei_json_output(
 
     return findings, counts
 
-def run_nuclei(session_dir: str, scan_id: Optional[str] = None) -> Tuple[bool, List[Dict[str, Any]]]:
+def run_nuclei(
+    session_dir: str,
+    scan_id: Optional[str] = None,
+    severity: Optional[str] = None
+) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Standard production entrypoint for Nuclei in YemenScan pipeline.
     Runs the official pinned Nuclei container with safe default flags, signed templates,
@@ -1191,13 +1198,14 @@ def run_nuclei(session_dir: str, scan_id: Optional[str] = None) -> Tuple[bool, L
         raw_filename = f"nuclei_raw_{profile_id}.jsonl"
         rate_limit = str(profile.get("limits", {}).get("rate_limit", 10))
         concurrency = str(profile.get("limits", {}).get("concurrency", 5))
+        effective_severity = (severity or os.getenv("NUCLEI_SEVERITY", "info,low,medium,high,critical")).strip()
 
         args = [
             "-l", f"/data/{targets_filename}",
             "-t", f"/data/{tpls_filename}",
             "-jsonl",
             "-o", f"/data/{raw_filename}",
-            "-severity", "medium,high,critical",
+            "-severity", effective_severity,
             "-pt", "http",
             "-etags", "dos,fuzz,bruteforce,intrusive,local",
             "-dut",
@@ -1568,7 +1576,8 @@ def run_wapiti_dast(
     scan_id: str,
     primary_urls: List[str],
     profile: str = "safe",
-    verify_ssl: bool = True
+    verify_ssl: bool = True,
+    modules: Optional[str] = None
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Executes Dynamic Application Security Testing (DAST) using official Wapiti container
@@ -1652,11 +1661,14 @@ def run_wapiti_dast(
         verify_ssl=verify_ssl
     )
     wapiti_plan = joint_plan.get("wapiti_plan") or {}
-    enabled_modules = wapiti_plan.get("enabled_modules", [
-        "http_headers", "csp", "cookieflags", "information_disclosure",
-        "stacktrace_disclosure", "https_redirect", "inconsistent_redirection",
-        "unsecure_password"
-    ])
+    if modules and isinstance(modules, str) and modules.strip():
+        enabled_modules = [m.strip() for m in modules.split(",") if m.strip()]
+    else:
+        enabled_modules = wapiti_plan.get("enabled_modules", [
+            "http_headers", "csp", "cookieflags", "information_disclosure",
+            "stacktrace_disclosure", "https_redirect", "inconsistent_redirection",
+            "unsecure_password"
+        ])
 
     targets_to_audit = target_origins[:5]
     combined_raw: Dict[str, Any] = {"vulnerabilities": {}, "anomalies": {}, "infos": {}}
@@ -1730,6 +1742,8 @@ def run_wapiti_dast(
                     rdata = json.load(rf)
                 for v_cat, v_list in rdata.get("vulnerabilities", {}).items():
                     combined_raw["vulnerabilities"].setdefault(v_cat, []).extend(v_list)
+                for a_cat, a_list in rdata.get("anomalies", {}).items():
+                    combined_raw["anomalies"].setdefault(a_cat, []).extend(a_list)
                 if "infos" in rdata and isinstance(rdata["infos"], dict):
                     for ik, iv in rdata["infos"].items():
                         if ik not in combined_raw["infos"]:
