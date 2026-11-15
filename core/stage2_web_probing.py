@@ -10,6 +10,7 @@ import requests
 from core.runner import run_docker_tool, run_local_tool, is_scan_cancelled, ScanCancelledException
 from core.session import update_status, get_status
 from core.target_prioritizer import prioritize_urls, prioritize_dict_records
+from core.scope_classifier import classify_scope
 
 # Kiterunner official constants
 KITERUNNER_WORDLIST_NAME = "routes-small.kite"
@@ -268,6 +269,9 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
     status_code_counts: Dict[str, int] = {}
     unique_hosts: Set[str] = set()
 
+    stat = get_status(scan_id) or {}
+    dom = stat.get("target_domain", "")
+
     for line in raw_lines:
         try:
             data = json.loads(line)
@@ -365,6 +369,18 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
 
         cdn_val = bool(data.get("cdn"))
         cdn_name_val = str(data.get("cdn_name") or "").strip()
+        location_val = data.get("location") or None
+
+        scope_info = classify_scope(
+            url=norm_url,
+            host=host,
+            root_domain=dom,
+            cname_list=cname_list,
+            asn_info=asn_dict,
+            cdn_name=cdn_name_val,
+            status_code=status_code,
+            location=location_val
+        )
 
         web_targets.append({
             "url": norm_url,
@@ -377,16 +393,20 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             "webserver": data.get("webserver") or "",
             "tech": data.get("tech") or [],
             "content_length": data.get("content_length"),
-            "location": data.get("location") or None,
+            "location": location_val,
             "cname": cname_list,
             "asn": asn_dict,
             "cdn": cdn_val,
             "cdn_name": cdn_name_val,
+            "is_third_party": scope_info["is_third_party"],
+            "provider": scope_info["provider"],
+            "hosting_type": scope_info["hosting_type"],
+            "has_redirect": scope_info["has_redirect"],
+            "redirect_type": scope_info["redirect_type"],
+            "redirect_url": scope_info["redirect_url"],
+            "scope_tag": scope_info["scope_tag"],
             "source": "httpx"
         })
-
-    stat = get_status(scan_id) or {}
-    dom = stat.get("target_domain", "")
 
     # Prioritize primary entered target at top of output lists without fabricating new URLs
     active_urls = prioritize_urls(active_urls, dom)
