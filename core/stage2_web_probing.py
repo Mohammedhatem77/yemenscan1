@@ -170,8 +170,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         )
         return True, [], []
 
-    # Write httpx_input.txt strictly from valid_inputs
-    with open(httpx_input_file, "w", encoding="utf-8") as f:
+    # Write httpx_input.txt strictly from valid_inputs (using newline="\n" for Linux Docker compatibility)
+    with open(httpx_input_file, "w", encoding="utf-8", newline="\n") as f:
         for inp in valid_inputs:
             f.write(f"{inp}\n")
 
@@ -675,8 +675,8 @@ def run_kiterunner_or_api_probing(
         pruned_sorted = sorted(deduped, key=_api_target_score)
         targets_for_scan = pruned_sorted[:10]
 
-    # Write normalized input file for Kiterunner
-    with open(kiterunner_input_file, "w", encoding="utf-8") as f:
+    # Write normalized input file for Kiterunner (using newline="\n" for Linux Docker compatibility)
+    with open(kiterunner_input_file, "w", encoding="utf-8", newline="\n") as f:
         for inp in targets_for_scan:
             f.write(f"{inp}\n")
 

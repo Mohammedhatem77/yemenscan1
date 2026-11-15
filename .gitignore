@@ -3,3 +3,24 @@ __pycache__/
 *.pyc
 scans/
 *.log
+nuclei_templates_official/
+scratch/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Scan outputs & temporary session results
+output/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+

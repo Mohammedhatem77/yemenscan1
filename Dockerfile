@@ -1,4 +1,5 @@
-# Multi-stage extraction of official ProjectDiscovery security binaries
+# Multi-stage extraction of official ProjectDiscovery security binaries and Docker CLI
+FROM docker:cli AS docker_cli
 FROM projectdiscovery/subfinder:latest AS subfinder_bin
 FROM projectdiscovery/naabu:latest AS naabu_bin
 FROM projectdiscovery/httpx:latest AS httpx_bin
@@ -24,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     musl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy pre-compiled, official security tool binaries into PATH
+# Copy pre-compiled, official security tool binaries into PATH as safe fallbacks
 COPY --from=subfinder_bin /usr/local/bin/subfinder /usr/local/bin/subfinder
 COPY --from=naabu_bin /usr/local/bin/naabu /usr/local/bin/naabu
 COPY --from=httpx_bin /usr/local/bin/httpx /usr/local/bin/httpx
@@ -36,16 +37,20 @@ RUN ln -s /usr/local/bin/kr /usr/local/bin/kiterunner
 RUN mkdir -p /opt/kiterunner
 COPY routes-small.kite /opt/kiterunner/routes-small.kite
 
+# Copy Docker CLI into web container to control host Docker daemon via /var/run/docker.sock
+COPY --from=docker_cli /usr/local/bin/docker /usr/local/bin/docker
+
 WORKDIR /app
 
-# Set environment variables
+# Set environment variables: strictly prioritize isolated Docker containers
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PREFER_LOCAL_TOOLS=true
+    PREFER_LOCAL_TOOLS=false \
+    YEMENSCAN_USE_DOCKER=true
 
 # Install Python requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --default-timeout=1000 --retries 10 --no-cache-dir -r requirements.txt
 
 # Copy source code and templates
 COPY . .
