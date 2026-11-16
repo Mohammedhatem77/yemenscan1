@@ -12,6 +12,8 @@ from core.stage3_vulnerabilities import (
     run_wapiti_dast,
     unify_and_save_vulnerabilities
 )
+from core.scope_classifier import load_scoped_urls
+from core.execution_engine import _run_nuclei_takeover_check
 
 def run_full_pipeline(domain: str, scan_id: str) -> None:
     """
@@ -118,10 +120,34 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
             progress=70,
             tool_status=tool_statuses
         )
+
+        # ── Scope Guard: عزل أصول الطرف الثالث وتطبيق نطاق الفحص الصارم ──
+        scoped = load_scoped_urls(session_dir)
+        in_scope_urls    = scoped["in_scope_urls"]
+        third_party_urls = scoped["third_party_urls"]
+        excluded_count   = scoped["excluded_count"]
+
+        if excluded_count > 0:
+            print(
+                f"[Scope Guard] ✅ خط الفحص الكامل: استبعاد {excluded_count} أصل تابع لطرف ثالث من DAST و CVEs.",
+                flush=True
+            )
+
+        # 1. Nuclei — فحص CVEs على الأصول الداخلية فقط
         all_targets = prepare_nuclei_targets(session_dir)
-        
+        if in_scope_urls and all_targets:
+            from urllib.parse import urlparse
+            in_scope_origins = {f"{urlparse(u).scheme}://{urlparse(u).netloc}".rstrip("/") for u in in_scope_urls if u}
+            filtered_targets = [t for t in all_targets if any(t.startswith(o) or o.startswith(t) for o in in_scope_origins)]
+            if filtered_targets:
+                all_targets = filtered_targets
+                nuclei_txt = os.path.join(session_dir, "nuclei_targets.txt")
+                with open(nuclei_txt, "w", encoding="utf-8") as fh:
+                    for t in all_targets:
+                        fh.write(f"{t}\n")
+
         nuclei_findings: List[Dict[str, Any]] = []
-        if all_targets:
+        if in_scope_urls and all_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
             ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
@@ -133,11 +159,23 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
             tool_statuses["nuclei"] = "skipped"
             ok_nuc = True
 
+        # 2. Nuclei Takeover — فحص سلبي أحادي فقط على أصول الطرف الثالث
+        if third_party_urls:
+            print(
+                f"[Scope Guard] 🎯 تشغيل Nuclei Takeover على {len(third_party_urls)} أصل خارجي...",
+                flush=True
+            )
+            ok_tak, tak_findings = _run_nuclei_takeover_check(session_dir, scan_id, third_party_urls)
+            if tak_findings:
+                nuclei_findings = nuclei_findings + tak_findings
+
+        # 3. Wapiti DAST — على الأصول الداخلية فقط (استبعاد 100% للطرف الثالث)
         wapiti_findings: List[Dict[str, Any]] = []
-        if active_urls:
+        dast_targets = in_scope_urls if in_scope_urls else []
+        if dast_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, active_urls)
+            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
             if ok_wap:
                 tool_statuses["wapiti"] = "success" if wapiti_findings else "empty"
             else:

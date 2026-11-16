@@ -183,6 +183,19 @@ def save_discovered_assets(
                     "status_code": status_code,
                     "content_length": item.get("content_length"),
                     "cpe": item.get("cpe", []),
+                    # Scope & Third-Party Guard fields
+                    "scope_tag": item.get("scope_tag", "in_scope_full"),
+                    "is_third_party": bool(item.get("is_third_party", False)),
+                    "provider": item.get("provider", "Self-Hosted (Local / On-Premise)"),
+                    "hosting_type": item.get("hosting_type", "self_hosted"),
+                    "cname": item.get("cname", []),
+                    "asn": item.get("asn", {}),
+                    "cdn": bool(item.get("cdn", False)),
+                    "cdn_name": item.get("cdn_name"),
+                    "has_redirect": bool(item.get("has_redirect", False)),
+                    "redirect_type": item.get("redirect_type"),
+                    "redirect_url": item.get("redirect_url"),
+                    "scope_badge": item.get("scope_badge"),
                 }
                 # Filter out None values
                 tech_stack = {k: v for k, v in tech_stack.items() if v is not None}
@@ -652,7 +665,9 @@ def complete_scan_session(
             session.stats_summary = stats_summary
         else:
             # Dynamically compute summary counts from database tables
-            asset_count = db.query(Assets).filter(Assets.scan_id == scan_id).count()
+            all_assets = db.query(Assets).filter(Assets.scan_id == scan_id).all()
+            in_scope_assets_count = sum(1 for a in all_assets if not (a.tech_stack or {}).get("is_third_party"))
+            third_party_assets_count = len(all_assets) - in_scope_assets_count
             findings = db.query(VulnerabilityFindings).filter(VulnerabilityFindings.scan_id == scan_id).all()
             severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
             for f in findings:
@@ -662,7 +677,9 @@ def complete_scan_session(
                 else:
                     severity_counts["info"] += 1
             session.stats_summary = {
-                "total_assets": asset_count,
+                "total_assets": len(all_assets),
+                "in_scope_assets": in_scope_assets_count,
+                "third_party_assets": third_party_assets_count,
                 "total_vulnerabilities": len(findings),
                 "severity_counts": severity_counts,
                 "completed_at": now_utc.isoformat(),
