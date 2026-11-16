@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import uuid
 from typing import Optional, List, Dict, Any
 from urllib.parse import urlparse
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends
@@ -1264,6 +1265,59 @@ def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
 def get_tools_status_endpoint():
     """التحقق من جاهزية وحالة الحاويات الست والأدوات في النظام."""
     return get_tools_readiness_status()
+
+
+class SaveStandaloneReq(BaseModel):
+    tool: str
+    target: str
+    results: Dict[str, Any]
+
+
+@app.post("/api/tools/save-to-db", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
+def save_standalone_to_db_endpoint(req: SaveStandaloneReq, db: Session = Depends(get_db)):
+    """حفظ نتائج الفحص المستقل كجلسة موثقة في قاعدة البيانات."""
+    try:
+        clean_target = req.target.strip()
+        if "://" in clean_target:
+            domain_part = urlparse(clean_target).netloc or clean_target
+        else:
+            domain_part = clean_target.split("/")[0]
+        domain_part = domain_part.split(":")[0].rstrip(".")
+        if not domain_part:
+            domain_part = "standalone-target"
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rand_id = uuid.uuid4().hex[:6]
+        scan_id = f"standalone_{req.tool}_{timestamp}_{rand_id}"
+
+        target, session = create_target_and_session(db, domain_part, scan_id)
+        
+        tool_lower = req.tool.lower().strip()
+        if tool_lower == "subfinder":
+            subdomains = req.results.get("subdomains", [])
+            save_discovered_assets(db, scan_id, subdomains, [])
+        elif tool_lower == "naabu":
+            open_ports = req.results.get("open_ports", [])
+            save_discovered_assets(db, scan_id, open_ports, [])
+        elif tool_lower == "httpx":
+            web_targets = req.results.get("web_targets", [])
+            active_urls = req.results.get("active_urls", [])
+            save_discovered_assets(db, scan_id, web_targets or active_urls, [])
+        elif tool_lower == "kiterunner":
+            api_endpoints = req.results.get("api_endpoints", [])
+            save_discovered_assets(db, scan_id, [], api_endpoints)
+        elif tool_lower in ("nuclei", "wapiti"):
+            findings = req.results.get("findings", [])
+            ingest_vulnerabilities(db, scan_id, findings)
+            
+        complete_scan_session(db, scan_id, status="completed")
+        return {
+            "status": "success",
+            "scan_id": scan_id,
+            "message": f"تم حفظ نتائج أداة {req.tool} بنجاح في قاعدة البيانات!"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"فشل حفظ النتائج في قاعدة البيانات: {str(e)}")
 # =====================================================================
 # Strict System Prompts and Post-Processing Sanitizers for AI Reports
 # =====================================================================
