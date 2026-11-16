@@ -806,20 +806,20 @@ def run_kiterunner_or_api_probing(
         "scan",
         "/data/kiterunner_input.txt",
         "-w", wordlist_param,
-        "-x", "10",
-        "-j", "20",
+        "-x", "20",
+        "-j", "40",
         "--max-redirects", "0",
         "-d", "1",
         "--quarantine-threshold", "10",
         "--disable-precheck",
         "--fail-status-codes", "404",
-        "-t", "3s",
+        "-t", "2s",
         "-o", "json",
         "-q"
     ]
 
-    # Calculate realistic timeout based on target count (min 300s, max 1200s)
-    exec_timeout = max(300, min(1200, len(targets_for_scan) * 60))
+    # Calculate realistic timeout based on target count (min 450s, max 1800s)
+    exec_timeout = max(450, min(1800, len(targets_for_scan) * 120))
 
     success, output = run_docker_tool(
         image=KITERUNNER_DOCKER_IMAGE,
@@ -844,6 +844,7 @@ def run_kiterunner_or_api_probing(
         fail_metadata = {
             "tool": "kiterunner",
             "status": "failed",
+            "error": output or "Kiterunner execution failed.",
             "input_count": len(valid_inputs),
             "raw_event_count": 0,
             "parsed_event_count": 0,

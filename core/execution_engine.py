@@ -280,15 +280,44 @@ def run_tool_in_session(scan_id: str, tool_name: str, options: Optional[Dict[str
 # 3. Independent Standalone Tool Execution (الفحص المستقل للأدوات)
 # ---------------------------------------------------------------------------
 
+def _extract_standalone_error(work_dir: str, tool_name: str, fallback_ar: str) -> str:
+    """Extracts informative, user-friendly Arabic error message from tool logs."""
+    stderr_file = os.path.join(work_dir, f"{tool_name}_stderr.log")
+    if os.path.exists(stderr_file):
+        try:
+            with open(stderr_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read().strip()
+                if content:
+                    content_lower = content.lower()
+                    if "timed out after" in content_lower:
+                        return (
+                            "استغرقت الأداة وقتاً أطول من المهلة المسموح بها (Timeout): "
+                            "الخادم المستهدف بطيء جداً في الاستجابة لحزم الفحص أو يفرض قيوداً على معدل الطلبات (Rate Limiting)."
+                        )
+                    if "docker" in content_lower and ("not" in content_lower or "connect" in content_lower or "daemon" in content_lower):
+                        return "محرك Docker غير متاح أو لا يمتلك صلاحية تشغيل الحاويات المعزولة."
+                    if "no such host" in content_lower or "could not resolve" in content_lower or "dns" in content_lower:
+                        return "تعذر الوصول إلى الهدف: فشل حل اسم النطاق (DNS Resolution Failure)."
+                    if "connection refused" in content_lower:
+                        return "تم رفض الاتصال من قبل الخادم المستهدف (Connection Refused)."
+                    return content[:300]
+        except Exception:
+            pass
+    return fallback_ar
+
+
 def run_standalone_subfinder(domain: str) -> Dict[str, Any]:
     """Runs Subfinder independently on a domain, returning discovered subdomains."""
     run_id = f"subfinder_{uuid.uuid4().hex[:8]}"
     work_dir = os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
     ok, subdomains = run_subfinder(domain, work_dir, run_id)
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "subfinder", "فشل تشغيل أداة Subfinder لاكتشاف النطاقات الفرعية.")
     return {
         "tool": "subfinder",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else f"تم اكتشاف {len(subdomains)} نطاق فرعي بنجاح.",
+        "detail": err_msg if not ok else None,
         "target_domain": domain,
         "subdomains_count": len(subdomains),
         "subdomains": subdomains
@@ -303,9 +332,12 @@ def run_standalone_naabu(target: str, ports: Optional[str] = None) -> Dict[str, 
 
     clean_target = target.strip()
     ok, open_ports = run_naabu([clean_target], work_dir, run_id)
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "naabu", "فشل تشغيل أداة Naabu لفحص المنافذ.")
     return {
         "tool": "naabu",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else f"تم فحص المنافذ واكتشاف {len(open_ports)} منفذ مفتوح.",
+        "detail": err_msg if not ok else None,
         "target": clean_target,
         "open_ports_count": len(open_ports),
         "open_ports": open_ports
@@ -330,9 +362,12 @@ def run_standalone_httpx(targets: List[str]) -> Dict[str, Any]:
                     f.write(f"{clean}\n")
 
     ok, web_targets, active_urls = run_httpx(work_dir, run_id)
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "httpx", "فشل تشغيل أداة HTTPX لفحص خدمات الويب.")
     return {
         "tool": "httpx",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else f"تم فحص خدمات الويب واكتشاف {len(active_urls)} خدمة نشطة.",
+        "detail": err_msg if not ok else None,
         "total_active_urls": len(active_urls),
         "active_urls": active_urls,
         "web_targets": web_targets
@@ -346,12 +381,28 @@ def run_standalone_kiterunner(target_url: str) -> Dict[str, Any]:
     os.makedirs(work_dir, exist_ok=True)
 
     ok, api_endpoints = run_kiterunner_or_api_probing([target_url.strip()], work_dir, run_id)
+
+    meta_file = os.path.join(work_dir, "kiterunner_metadata.json")
+    meta = {}
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            pass
+
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "kiterunner", "فشل تشغيل أداة Kiterunner لاستكشاف مسارات الـ APIs.")
     return {
         "tool": "kiterunner",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else "اكتمل فحص Kiterunner بنجاح.",
+        "detail": err_msg if not ok else None,
         "target_url": target_url.strip(),
         "total_api_endpoints": len(api_endpoints),
-        "api_endpoints": api_endpoints
+        "api_endpoints": api_endpoints,
+        "diagnostic_reason": meta.get("diagnostic_reason"),
+        "raw_event_count": meta.get("raw_event_count", 0),
+        "filter_stats": meta.get("filter_stats", {})
     }
 
 
@@ -367,9 +418,12 @@ def run_standalone_nuclei(target_url: str, severity: Optional[str] = None) -> Di
 
     prepare_nuclei_targets(work_dir)
     ok, findings = run_nuclei(work_dir, run_id)
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "nuclei", "فشل تشغيل أداة Nuclei لفحص الثغرات.")
     return {
         "tool": "nuclei",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else f"اكتمل فحص Nuclei واكتشاف {len(findings)} ثغرة.",
+        "detail": err_msg if not ok else None,
         "target_url": target_url.strip(),
         "total_findings": len(findings),
         "findings": findings
@@ -383,9 +437,12 @@ def run_standalone_wapiti(target_url: str, modules: Optional[str] = None) -> Dic
     os.makedirs(work_dir, exist_ok=True)
 
     ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()])
+    err_msg = "" if ok else _extract_standalone_error(work_dir, "wapiti", "فشل تشغيل أداة Wapiti للفحص الحركي.")
     return {
         "tool": "wapiti",
         "status": "success" if ok else "failed",
+        "message": err_msg if not ok else f"اكتمل فحص Wapiti واكتشاف {len(findings)} ثغرة.",
+        "detail": err_msg if not ok else None,
         "target_url": target_url.strip(),
         "total_findings": len(findings),
         "findings": findings
