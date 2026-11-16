@@ -7,10 +7,10 @@
 
 FROM golang:1.19-alpine@sha256:0ec0646e208ea58e5d29e558e39f2e59fccf39b7bda306cb53bbaff91919eca5 AS builder
 
-WORKDIR /src
+WORKDIR /go/src/github.com/assetnote/kiterunner
 COPY kiterunner-src/kiterunner-1.0.2/ ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -mod=mod \
+RUN GO111MODULE=off CGO_ENABLED=0 GOOS=linux go build \
     -ldflags "-X 'github.com/assetnote/kiterunner/cmd/kiterunner/cmd.Version=v1.0.2-yemscan1' -X 'github.com/assetnote/kiterunner/cmd/kiterunner/cmd.Commit=e7a7fa6' -X 'github.com/assetnote/kiterunner/cmd/kiterunner/cmd.Date=2021-04-11' -s -w" \
     -o /kr ./cmd/kiterunner
 
@@ -20,7 +20,6 @@ FROM alpine:3.18@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979
 RUN apk add --no-cache ca-certificates bind-tools
 
 COPY --from=builder /kr /usr/local/bin/kr
-RUN ln -s /usr/local/bin/kr /usr/local/bin/kiterunner
 
 # Bundle official routes-small.kite
 RUN mkdir -p /opt/kiterunner /data

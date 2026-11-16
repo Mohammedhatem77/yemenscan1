@@ -366,7 +366,7 @@ def run_standalone_nuclei(target_url: str, severity: Optional[str] = None) -> Di
         f.write(f"{target_url.strip()}\n")
 
     prepare_nuclei_targets(work_dir)
-    ok, findings = run_nuclei(work_dir, run_id)
+    ok, findings = run_nuclei(work_dir, run_id, severity=severity)
     return {
         "tool": "nuclei",
         "status": "success" if ok else "failed",
@@ -382,7 +382,7 @@ def run_standalone_wapiti(target_url: str, modules: Optional[str] = None) -> Dic
     work_dir = os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
-    ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()])
+    ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()], modules=modules)
     return {
         "tool": "wapiti",
         "status": "success" if ok else "failed",
