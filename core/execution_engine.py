@@ -40,36 +40,73 @@ def _run_nuclei_takeover_check(
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Lightweight Nuclei Takeover-only check for third-party / external-redirect assets.
-    Uses -tags takeover -severity critical,high,medium — passive single-GET check.
+    Uses passive single-GET takeover templates via isolated Docker (DooD) through
+    `run_docker_tool` with proper volume translation and matching host/container filenames.
     Keeps zero dependency on stage3_vulnerabilities internals (safe from teammate conflict).
     """
     if not third_party_urls:
         return True, []
 
-    takeover_txt = os.path.join(session_dir, "nuclei_takeover_targets.txt")
+    targets_filename = "nuclei_takeover_targets.txt"
+    findings_filename = "nuclei_takeover_findings.jsonl"
+    takeover_txt = os.path.join(session_dir, targets_filename)
+    out_file = os.path.join(session_dir, findings_filename)
+
+    # Remove any stale findings file from a previous run
+    if os.path.exists(out_file):
+        try:
+            os.remove(out_file)
+        except Exception:
+            pass
+
     with open(takeover_txt, "w", encoding="utf-8") as fh:
         for u in third_party_urls:
             fh.write(f"{u}\n")
 
-    out_file = os.path.join(session_dir, "nuclei_takeover_findings.jsonl")
-    container_input  = "/nuclei_input/takeover_targets.txt"
-    container_output = "/nuclei_input/takeover_findings.jsonl"
+    container_input = f"/data/{targets_filename}"
+    container_output = f"/data/{findings_filename}"
 
-    docker_args = [
-        "run", "--rm",
-        "-v", f"{session_dir}:/nuclei_input",
-        _NUCLEI_TAKEOVER_IMAGE,
+    # Resolve local takeover templates directory (prefer official if present, else runtime bundle)
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    official_tpl_dir = os.path.join(base_dir, "nuclei_templates_official")
+    runtime_tpl_dir = os.path.join(base_dir, "nuclei_runtime_templates")
+
+    extra_vols: Optional[List[Tuple[str, str]]] = None
+    nuclei_args: List[str] = [
         "-l", container_input,
-        "-tags", "takeover",
-        "-severity", "critical,high,medium",
-        "-je", container_output,
-        "-silent",
-        "-no-color",
     ]
+
+    if os.path.isdir(os.path.join(official_tpl_dir, "http", "takeovers")):
+        extra_vols = [(official_tpl_dir, "/opt/nuclei-templates")]
+        nuclei_args.extend(["-t", "/opt/nuclei-templates/http/takeovers", "-dut"])
+    elif os.path.isdir(os.path.join(runtime_tpl_dir, "http", "takeovers")):
+        extra_vols = [(runtime_tpl_dir, "/opt/nuclei-templates")]
+        nuclei_args.extend(["-t", "/opt/nuclei-templates/http/takeovers", "-dut"])
+    else:
+        nuclei_args.extend(["-tags", "takeover"])
+
+    nuclei_args.extend([
+        "-severity", "critical,high,medium",
+        "-jsonl",
+        "-o", container_output,
+        "-timeout", "5",
+        "-retries", "0",
+        "-duc",
+        "-silent",
+        "-nc",
+    ])
 
     findings: List[Dict[str, Any]] = []
     try:
-        ok, stdout, stderr = run_docker_tool(docker_args, timeout=300)
+        ok, output = run_docker_tool(
+            image=_NUCLEI_TAKEOVER_IMAGE,
+            args=nuclei_args,
+            volume_dir=session_dir,
+            timeout=300,
+            container_mount="/data",
+            extra_volumes=extra_vols,
+            scan_id=scan_id,
+        )
         if os.path.exists(out_file):
             with open(out_file, "r", encoding="utf-8", errors="replace") as rf:
                 for line in rf:
@@ -77,10 +114,31 @@ def _run_nuclei_takeover_check(
                     if line:
                         try:
                             rec = json.loads(line)
-                            rec.setdefault("source", "nuclei-takeover")
-                            findings.append(rec)
+                            info = rec.get("info") if isinstance(rec.get("info"), dict) else {}
+                            tid = rec.get("template-id") or rec.get("id") or "nuclei-takeover"
+                            title = info.get("name") or rec.get("title") or tid
+                            sev = str(info.get("severity") or rec.get("severity") or "HIGH").upper()
+                            matched_url = rec.get("matched-at") or rec.get("host") or rec.get("url") or ""
+                            normalized_rec = {
+                                "id": tid,
+                                "template_id": tid,
+                                "title": title,
+                                "severity": sev,
+                                "url": matched_url,
+                                "description": info.get("description") or rec.get("description") or f"Potential subdomain takeover detected ({title}).",
+                                "remediation": info.get("remediation") or rec.get("remediation") or "Remove dangling DNS CNAME/A records pointing to unclaimed third-party services.",
+                                "category": "Subdomain Takeover",
+                                "coverage_family": "subdomain_takeover",
+                                "source": "Nuclei Engine (Takeover)",
+                                "sources": ["nuclei"],
+                                "tags": info.get("tags") or ["takeover"],
+                                "evidence": [matched_url] if matched_url else [],
+                            }
+                            findings.append(normalized_rec)
                         except Exception:
                             pass
+        if not ok and output:
+            print(f"[Scope Guard] ⚠️ Nuclei Takeover تنبيه تشغيل: {output.strip()[:200]}", flush=True)
         print(
             f"[Scope Guard] ✅ Nuclei Takeover: وجد {len(findings)} ثغرة محتملة في الأصول الخارجية.",
             flush=True

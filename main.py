@@ -745,7 +745,7 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
                 cvss_vector = (catalog.cvss_vector if catalog else None) or raw.get("cvss_vector")
                 owasp_cat = (catalog.owasp_category if catalog else None) or raw.get("category", "General")
                 title = (catalog.title if catalog else None) or raw.get("title", "Unknown Vulnerability")
-                desc = (catalog.description if catalog else None) or raw.get("description", "")
+                desc = raw.get("description") or (catalog.description if catalog else None) or ""
                 remediation = (catalog.standard_remediation if catalog else None) or raw.get("remediation", "")
 
                 # Dynamic fallback enrichment from normalizer if cvss_score is missing
@@ -816,12 +816,33 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
             except Exception:
                 results = []
 
+    # Load Smart Triage metadata (suppressed redirect False Positives & canonical deduplication)
+    triage_suppressed_count = 0
+    triage_canonicalized_count = 0
+    triage_summary = ""
+    triage_suppressed_items = []
+    try:
+        triage_file = os.path.join(get_session_dir(active_scan_id), "triage_suppressed.json")
+        if os.path.exists(triage_file):
+            with open(triage_file, "r", encoding="utf-8") as tf:
+                triage_meta = json.load(tf)
+                triage_suppressed_count = int(triage_meta.get("suppressed_count", 0) or 0)
+                triage_canonicalized_count = int(triage_meta.get("canonicalized_count", 0) or 0)
+                triage_summary = triage_meta.get("summary_ar", "") or ""
+                triage_suppressed_items = triage_meta.get("suppressed_items", []) or []
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "scan_id": active_scan_id,
         "total_vulnerabilities_found": len(results),
         "vulnerabilities": results,
-        "data": results
+        "data": results,
+        "triage_suppressed_count": triage_suppressed_count,
+        "triage_canonicalized_count": triage_canonicalized_count,
+        "triage_summary": triage_summary,
+        "triage_suppressed_items": triage_suppressed_items,
     }
 
 @app.get("/api/scans/{scan_id}/discovery", tags=["2. نتائج واستخراج الأصول والثغرات (Findings & Assets)"])
@@ -2205,7 +2226,7 @@ def generate_ai_report(
                     cvss_vector = (catalog.cvss_vector if catalog else None) or raw.get("cvss_vector")
                     owasp_cat = (catalog.owasp_category if catalog else None) or raw.get("category", "General")
                     title = (catalog.title if catalog else None) or raw.get("title", "Unknown Vulnerability")
-                    desc = (catalog.description if catalog else None) or raw.get("description", "")
+                    desc = raw.get("description") or (catalog.description if catalog else None) or ""
                     remediation = (catalog.standard_remediation if catalog else None) or raw.get("remediation", "")
 
                     vulns_list.append({
