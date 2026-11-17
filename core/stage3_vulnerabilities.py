@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin, urlunparse
 import requests
 import urllib3
 import yaml
@@ -1878,6 +1878,346 @@ def _extract_finding_archetype(item: Dict[str, Any]) -> Tuple[str, ...]:
         
     return ("id_path", path, fid)
 
+
+# ==============================================================================
+# Smart Redirect-Aware Security Header Verification & Triage Layer
+# ==============================================================================
+_REDIRECT_TRIAGE_HEADER_ARCHETYPES: Set[str] = {
+    "csp",
+    "clickjacking",
+    "mime-sniffing",
+    "hsts",
+    "permissions-policy",
+    "cleartext",
+}
+
+_RFC2606_TEST_DOMAINS: Tuple[str, ...] = (
+    "example.com",
+    "example.org",
+    "example.net",
+    "localhost",
+)
+_RFC2606_TEST_SUFFIXES: Tuple[str, ...] = (
+    ".example.com",
+    ".example.org",
+    ".example.net",
+    ".example",
+    ".test",
+    ".invalid",
+    ".localhost",
+)
+
+
+def _is_rfc2606_test_host(hostname: str) -> bool:
+    """Returns True for RFC 2606 reserved test/local hostnames to keep unit tests offline and deterministic."""
+    h = (hostname or "").strip().lower().rstrip(".")
+    if not h:
+        return True
+    if h in _RFC2606_TEST_DOMAINS or h in ("127.0.0.1", "::1"):
+        return True
+    return any(h.endswith(sfx) for sfx in _RFC2606_TEST_SUFFIXES)
+
+
+def _canonicalize_url_strip_default_port(url: str) -> str:
+    """
+    Normalizes an HTTP/HTTPS URL per RFC 3986 by stripping explicit default ports
+    (:80 for http, :443 for https) while preserving path, query, fragment, and
+    all non-default service ports (e.g., :2083, :8080, :8443).
+    """
+    if not url or not isinstance(url, str):
+        return url
+    raw = url.strip()
+    if not raw.lower().startswith(("http://", "https://")):
+        return raw
+    try:
+        parsed = urlparse(raw)
+        scheme = (parsed.scheme or "").lower()
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if not hostname:
+            return raw
+        try:
+            port = parsed.port
+        except ValueError:
+            return raw
+        host_fmt = f"[{hostname}]" if ":" in hostname else hostname
+        if port is None or (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+            clean_netloc = host_fmt
+        else:
+            clean_netloc = f"{host_fmt}:{port}"
+        return urlunparse((scheme, clean_netloc, parsed.path or "/", parsed.params, parsed.query, parsed.fragment))
+    except Exception:
+        return raw
+
+
+def _canonical_dedup_netloc(url: str) -> str:
+    """
+    Computes a canonical deduplication key for the host/service:
+    - Standard web ports (None, 80, 443) collapse to the bare lowercase hostname
+      so http://site.com/, https://site.com/, https://site.com:443/, and
+      http://site.com:443/ deduplicate cleanly into a single web service entry.
+    - Non-standard ports (e.g., :2083 cPanel, :8080, :3000) retain hostname:port
+      so distinct services remain independently reported.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parsed = urlparse(url.strip())
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if not hostname:
+            return (parsed.netloc or "").lower()
+        try:
+            port = parsed.port
+        except ValueError:
+            return (parsed.netloc or "").lower()
+        host_fmt = f"[{hostname}]" if ":" in hostname else hostname
+        if port in (None, 80, 443):
+            return host_fmt
+        return f"{host_fmt}:{port}"
+    except Exception:
+        return (urlparse(url).netloc or "").lower()
+
+
+def _inspect_redirect_chain_headers(
+    url: str,
+    max_hops: int = 5,
+    timeout: float = 6.0
+) -> Optional[Dict[str, Any]]:
+    """
+    Performs a lightweight, non-intrusive HTTP header inspection following up to `max_hops`
+    redirects without downloading response bodies (stream=True + immediate close).
+    Fail-safe: returns None on any network error, timeout, or redirect loop.
+    """
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return None
+
+    parsed = urlparse(url)
+    if _is_rfc2606_test_host(parsed.hostname or ""):
+        return None
+
+    session = requests.Session()
+    req_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    current_url = url
+    visited: Set[str] = {current_url}
+    hops: List[Dict[str, Any]] = []
+    initial_status: Optional[int] = None
+
+    try:
+        for _ in range(max_hops + 1):
+            resp = session.get(
+                current_url,
+                headers=req_headers,
+                allow_redirects=False,
+                timeout=timeout,
+                verify=False,
+                stream=True,
+            )
+            try:
+                status_code = int(resp.status_code)
+                headers_lower = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+            finally:
+                resp.close()
+
+            if initial_status is None:
+                initial_status = status_code
+
+            if status_code in (301, 302, 303, 307, 308) and headers_lower.get("location"):
+                next_url = urljoin(current_url, headers_lower["location"].strip())
+                hops.append({
+                    "from": current_url,
+                    "status_code": status_code,
+                    "to": next_url,
+                })
+                if next_url in visited:
+                    # Redirect loop detected — fail safe
+                    return None
+                visited.add(next_url)
+                current_url = next_url
+                continue
+
+            return {
+                "initial_url": url,
+                "initial_status": initial_status,
+                "is_redirect": len(hops) > 0,
+                "redirect_hops": hops,
+                "final_url": current_url,
+                "final_status": status_code,
+                "final_headers": headers_lower,
+            }
+
+        # Exceeded max_hops without reaching a terminal response — fail safe
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def _resolve_header_triage_type(finding: Dict[str, Any]) -> Optional[str]:
+    """
+    Returns the header-triage category if the finding is an eligible passive HTTP security
+    header / transport redirect alert, or None for all substantive vulnerabilities (CVEs,
+    injections, auth, cleartext passwords, etc.).
+    """
+    fid = str(finding.get("id", "")).lower()
+    title = str(finding.get("title", "")).lower()
+    desc = str(finding.get("description", "")).lower()
+    cov = str(finding.get("coverage_family", "")).lower()
+
+    # Never suppress credential / password submission vulnerabilities (e.g., CWE-319)
+    if "password" in title or "password" in fid or "password" in cov or "cleartext_password" in cov:
+        return None
+
+    archetype = _extract_finding_archetype(finding)
+    if len(archetype) >= 2 and archetype[0] == "server" and archetype[1] in _REDIRECT_TRIAGE_HEADER_ARCHETYPES:
+        return archetype[1]
+
+    if "unencrypted channel" in title or "unencrypted channel" in desc:
+        return "cleartext"
+
+    return None
+
+
+def _is_header_protected_on_final_response(
+    triage_type: str,
+    probe: Dict[str, Any],
+    finding: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """
+    Evaluates whether the security control flagged on a redirect endpoint is actually
+    present and enforced on the final canonical 2xx destination response.
+    """
+    if not probe or not probe.get("is_redirect"):
+        return False, ""
+
+    final_status = int(probe.get("final_status") or 0)
+    if not (200 <= final_status < 300):
+        # Fail-safe: do not suppress if final destination returned 403/5xx/etc.
+        return False, ""
+
+    fh: Dict[str, str] = probe.get("final_headers") or {}
+    final_url = probe.get("final_url", "")
+    initial_url = probe.get("initial_url", "")
+
+    if triage_type == "csp":
+        csp_val = fh.get("content-security-policy", "").strip()
+        if csp_val:
+            return True, f"ترويسة Content-Security-Policy مفعلة فعلياً في الوجهة النهائية ({final_url})."
+
+    elif triage_type == "clickjacking":
+        xfo = fh.get("x-frame-options", "").strip().lower()
+        csp_val = fh.get("content-security-policy", "").lower()
+        if ("deny" in xfo or "sameorigin" in xfo) or ("frame-ancestors" in csp_val):
+            return True, f"حماية Clickjacking مفعلة فعلياً في الوجهة النهائية ({final_url}) عبر X-Frame-Options/frame-ancestors."
+
+    elif triage_type == "mime-sniffing":
+        xcto = fh.get("x-content-type-options", "").strip().lower()
+        if "nosniff" in xcto:
+            return True, f"ترويسة X-Content-Type-Options: nosniff مفعلة فعلياً في الوجهة النهائية ({final_url})."
+
+    elif triage_type == "hsts":
+        hsts_val = fh.get("strict-transport-security", "").strip()
+        if hsts_val and final_url.lower().startswith("https://"):
+            return True, f"ترويسة Strict-Transport-Security (HSTS) مفعلة فعلياً في الوجهة النهائية ({final_url})."
+
+    elif triage_type == "permissions-policy":
+        if fh.get("permissions-policy", "").strip() or fh.get("feature-policy", "").strip():
+            return True, f"ترويسة Permissions-Policy مفعلة فعلياً في الوجهة النهائية ({final_url})."
+
+    elif triage_type == "cleartext":
+        hsts_val = fh.get("strict-transport-security", "").strip()
+        if initial_url.lower().startswith("http://") and final_url.lower().startswith("https://") and hsts_val:
+            return True, f"رابط HTTP يحوّل فورياً ودائماً إلى HTTPS مع تفعيل HSTS في الوجهة النهائية ({final_url})."
+
+    return False, ""
+
+
+def filter_redirect_header_false_positives(
+    findings: List[Dict[str, Any]],
+    header_inspector: Optional[Any] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """
+    Post-scan Smart Triage Layer for Stage 3 Vulnerability Findings:
+    1. Identifies passive HTTP security header alerts flagged on redirect endpoints (301/302/307/308).
+    2. Follows the redirect chain to the canonical 2xx destination (with per-URL caching).
+    3. Suppresses proven False Positives where the final destination enforces the security header.
+    4. Canonicalizes genuinely missing header findings discovered across multiple redirect ports
+       (e.g., Cloudflare :443, :2083, :2087, :8443 -> https://www.target.com/) so downstream
+       deduplication collapses them into a single accurate finding on the canonical origin.
+    5. Never touches substantive flaws (CVEs, SQLi, XSS, LFI, RCE, secrets, cleartext passwords)
+       and fails safe on network errors.
+    """
+    if not findings:
+        return [], [], 0
+
+    if os.getenv("YEMENSCAN_DISABLE_REDIRECT_TRIAGE", "false").lower() in ("true", "1", "yes"):
+        return list(findings), [], 0
+
+    inspector = header_inspector or _inspect_redirect_chain_headers
+    probe_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    verified_findings: List[Dict[str, Any]] = []
+    suppressed_fps: List[Dict[str, Any]] = []
+    canonicalized_count = 0
+
+    for finding in findings:
+        triage_type = _resolve_header_triage_type(finding)
+        url = (finding.get("url") or "").strip()
+
+        if not triage_type or not url:
+            verified_findings.append(finding)
+            continue
+
+        if url not in probe_cache:
+            probe_cache[url] = inspector(url)
+
+        probe = probe_cache[url]
+        if not probe or not probe.get("is_redirect"):
+            verified_findings.append(finding)
+            continue
+
+        is_protected, reason = _is_header_protected_on_final_response(triage_type, probe, finding)
+        if is_protected:
+            suppressed_fps.append({
+                "id": finding.get("id", ""),
+                "title": finding.get("title", ""),
+                "archetype": triage_type,
+                "initial_url": url,
+                "initial_status": probe.get("initial_status"),
+                "final_url": probe.get("final_url", ""),
+                "final_status": probe.get("final_status"),
+                "reason": reason,
+            })
+            continue
+
+        # Finding is genuinely missing even on the final 2xx destination:
+        # Remap URL to the canonical destination (stripping default :80/:443 ports per RFC 3986)
+        # so duplicate redirect ports collapse cleanly.
+        final_url = _canonicalize_url_strip_default_port(probe.get("final_url", ""))
+        final_status = int(probe.get("final_status") or 0)
+        if final_url and (200 <= final_status < 300) and final_url != url:
+            canonical_finding = dict(finding)
+            canonical_finding["url"] = final_url
+            canonical_origin = normalize_target_origin(final_url)
+            if canonical_origin:
+                canonical_finding["target"] = canonical_origin
+            canonical_finding["original_redirect_url"] = url
+            verified_findings.append(canonical_finding)
+            canonicalized_count += 1
+        else:
+            verified_findings.append(finding)
+
+    return verified_findings, suppressed_fps, canonicalized_count
+
+
 def unify_and_save_vulnerabilities(
     session_dir: str,
     scan_id: str,
@@ -1900,6 +2240,45 @@ def unify_and_save_vulnerabilities(
     
     severity_rank = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
     combined_raw = nuclei_findings + wapiti_findings
+
+    # Smart Redirect-Aware Header Verification & Canonical Deduplication Triage
+    combined_raw, suppressed_fps, canonicalized_count = filter_redirect_header_false_positives(combined_raw)
+    triage_file = os.path.join(session_dir, "triage_suppressed.json")
+    if suppressed_fps or canonicalized_count > 0:
+        unique_final_urls = sorted(list({item.get("final_url", "") for item in suppressed_fps if item.get("final_url")}))
+        dest_hint = f" ({', '.join(unique_final_urls[:3])})" if unique_final_urls else ""
+        if suppressed_fps and canonicalized_count > 0:
+            triage_summary_ar = (
+                f"تم التحقق الشبكي المباشر واستبعاد {len(suppressed_fps)} تنبيهات آلية كاذبة (False Positives) "
+                f"ناتجة عن روابط إعادة التوجيه (301/308 Redirect) بعد التأكد من وجود ترويسات الحماية في الوجهة النهائية{dest_hint}، "
+                f"كما تم توحيد {canonicalized_count} ملاحظات مكررة عبر منافذ التحويل نحو المسار الرسمي."
+            )
+        elif suppressed_fps:
+            triage_summary_ar = (
+                f"تم التحقق الشبكي المباشر واستبعاد {len(suppressed_fps)} تنبيهات آلية كاذبة (False Positives) "
+                f"ناتجة عن روابط إعادة التوجيه (301/308 Redirect) بعد التأكد من تفعيل ترويسات الحماية فعلياً في الوجهة النهائية{dest_hint}."
+            )
+        else:
+            triage_summary_ar = (
+                f"تم توحيد {canonicalized_count} ملاحظات ترويسات مكررة عبر منافذ إعادة التوجيه نحو الوجهة الرسمية الفعلية لمنع تضخم النتائج."
+            )
+        triage_payload = {
+            "suppressed_count": len(suppressed_fps),
+            "canonicalized_count": canonicalized_count,
+            "summary_ar": triage_summary_ar,
+            "suppressed_items": suppressed_fps,
+        }
+        try:
+            with open(triage_file, "w", encoding="utf-8") as tf:
+                json.dump(triage_payload, tf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        print(f"[*] التحقق الذكي (Smart Triage): {triage_summary_ar}", flush=True)
+    elif os.path.exists(triage_file):
+        try:
+            os.remove(triage_file)
+        except Exception:
+            pass
     
     # Check if there are substantive vulnerabilities
     has_substantive_findings = any(
@@ -1916,9 +2295,9 @@ def unify_and_save_vulnerabilities(
         if has_substantive_findings and fid == "WAP-AUDIT-BASELINE":
             continue
             
-        u = finding.get("url", "")
-        parsed = urlparse(u)
-        netloc = (parsed.netloc or "").lower()
+        u = _canonicalize_url_strip_default_port(finding.get("url", ""))
+        finding["url"] = u
+        netloc = _canonical_dedup_netloc(u)
         archetype = _extract_finding_archetype(finding)
         group_key = (netloc, archetype)
         
@@ -1970,7 +2349,16 @@ def unify_and_save_vulnerabilities(
             else:
                 primary = existing
                 secondary = finding
-                
+
+            # Prefer canonical HTTPS URL over HTTP when deduplicating the same web service
+            p_url = (primary.get("url") or "").strip()
+            s_url = (secondary.get("url") or "").strip()
+            if p_url.lower().startswith("http://") and s_url.lower().startswith("https://"):
+                primary["url"] = s_url
+                s_origin = normalize_target_origin(s_url)
+                if s_origin:
+                    primary["target"] = s_origin
+
             primary["source"] = merged_source_str
             primary["sources"] = merged_sources
 
@@ -2107,9 +2495,15 @@ def unify_and_save_vulnerabilities(
         if cnt > 0:
             print(f"    - {sev_name.upper()}: {cnt}", flush=True)
             
+    triage_suffix = ""
+    if suppressed_fps:
+        triage_suffix = f" [Smart Triage: تم استبعاد {len(suppressed_fps)} تنبيهات تحويل كاذبة تلقائياً]"
+    elif canonicalized_count > 0:
+        triage_suffix = f" [Smart Triage: تم توحيد {canonicalized_count} ملاحظات تحويل مكررة]"
+
     update_status(
         scan_id,
-        log_message=f"تم إعداد التقرير الموحد للثغرات: الإجمالي {len(all_vulns)} ثغرة وملاحظة (تكامل بين Nuclei و Wapiti بدون تكرار).",
+        log_message=f"تم إعداد التقرير الموحد للثغرات: الإجمالي {len(all_vulns)} ثغرة وملاحظة (تكامل بين Nuclei و Wapiti بدون تكرار).{triage_suffix}",
         stats_update={
             "vulnerabilities_count": len(all_vulns),
             "vuln_by_severity": severity_counts
