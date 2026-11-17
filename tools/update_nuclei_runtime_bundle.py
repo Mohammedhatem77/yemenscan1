@@ -3,21 +3,37 @@ import sys
 import json
 import shutil
 import hashlib
-from typing import Dict, List, Set, Any, Tuple
+import re
+from collections import defaultdict
+from typing import Dict, List, Set, Any, Tuple, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from core.nuclei_template_selector import (
-    UNIVERSAL_SAFE_BASELINE_PATHS,
-    TECH_TAXONOMY,
-    ELIGIBLE_CATEGORIES,
-    SafeManifestManager,
-    classify_template_content
-)
+from audit_manifest import audit_templates
 
-# Capabilities explicitly owned by Wapiti to prune from Nuclei runtime
+# Regular expressions for metadata and safety checks
+re_id = re.compile(r"^id:\s*([^\s#]+)", re.MULTILINE)
+re_name = re.compile(r"^\s*name:\s*(.+)$", re.MULTILINE)
+re_sev = re.compile(r"^\s*severity:\s*([a-zA-Z]+)", re.MULTILINE)
+re_tags = re.compile(r"^\s*tags:\s*(.+)$", re.MULTILINE)
+re_cve = re.compile(r"(CVE-\d{4}-\d{4,7})", re.IGNORECASE)
+
+BLOCKED_TAGS: Set[str] = {"intrusive", "dos", "fuzz", "bruteforce", "local"}
+re_unsafe = re.compile(r"unsafe:\s*true", re.IGNORECASE)
+re_race = re.compile(r"race:\s*true", re.IGNORECASE)
+re_method = re.compile(r"method:\s*([A-Za-z]+)", re.IGNORECASE)
+re_raw = re.compile(r"^\s*(?:-\s*)?raw:\s*", re.MULTILINE | re.IGNORECASE)
+re_payloads = re.compile(r"^\s*(?:-\s*)?payloads:\s*", re.MULTILINE | re.IGNORECASE)
+re_attack = re.compile(r"attack:\s*([a-zA-Z]+)", re.IGNORECASE)
+
+BLOCKED_KEYWORDS: List[str] = [
+    "reverse shell", "bind shell", "destructive action", 
+    "configuration modification", "password modification", "database modification"
+]
+
+# Capabilities explicitly owned by Wapiti (excluded from Nuclei to avoid duplicate traffic & findings)
 WAPITI_OWNED_TAGS: Set[str] = {
     "headers", "security-headers", "cookie", "httponly", 
     "samesite", "csp", "clickjacking", "x-frame-options", "cors"
@@ -25,7 +41,7 @@ WAPITI_OWNED_TAGS: Set[str] = {
 WAPITI_OWNED_KEYWORDS: List[str] = [
     "x-content-type-options", "strict-transport-security", 
     "content-security-policy", "cookie-flags", "missing-header",
-    "http-missing-headers"
+    "http-missing-headers", "x-frame-options"
 ]
 
 def compute_file_sha256(filepath: str) -> str:
@@ -54,117 +70,165 @@ def determine_coverage_family(tpl_id: str, rel_path: str, tags: List[str]) -> st
         return "exposed_panels"
     if "backup" in rel_low:
         return "backup_file_discovery"
-    if any(t in ["tech", "version", "detect"] for t in tags):
+    if any(t in ["tech", "version", "detect"] for t in tags) or "technologies/" in rel_low:
         return "technology_version_check"
-    if any(cat in rel_low for cat in ["cves", "vulnerabilities"]):
+    if any(cat in rel_low for cat in ["cves", "vulnerabilities", "misconfiguration"]):
         return "product_specific_vulnerability"
     return "safe_signature_based_checks"
 
-def build_runtime_bundle(
+def estimate_request_cost(content: str) -> int:
+    if re_raw.search(content):
+        raw_blocks = re.findall(r"^\s*-\s*\|", content, re.MULTILINE)
+        raw_lines = re.findall(r"^\s*-\s*[\'\"]?(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+", content, re.MULTILINE)
+        count = max(len(raw_blocks), len(raw_lines), 1)
+        return min(count, 30)
+    if re_payloads.search(content) or re_attack.search(content):
+        payload_items = re.findall(r"^\s*-\s*[\'\"]?[a-zA-Z0-9_\-\.\/]+[\'\"]?\s*$", content, re.MULTILINE)
+        multiplier = max(1, len(payload_items))
+        return min(multiplier, 30)
+    path_entries = re.findall(r"^\s*-\s*[\'\"]?(?:\{\{(?:BaseURL|RootURL|Hostname)\}\}|\/[a-zA-Z0-9_\-\.\/\?=&%])[^\'\"\n]*", content, re.MULTILINE)
+    path_headers = re.findall(r"^\s*path:\s*$", content, re.MULTILINE)
+    if path_entries:
+        return min(len(path_entries), 30)
+    if path_headers:
+        return min(len(path_headers), 30)
+    return 1
+
+def build_curated_runtime_bundle(
     official_dir: str = os.path.join(BASE_DIR, "nuclei_templates_official"),
     runtime_dir: str = os.path.join(BASE_DIR, "nuclei_runtime_templates"),
     manifest_output_path: str = os.path.join(BASE_DIR, "nuclei_runtime_manifest.json")
 ) -> Dict[str, Any]:
-    print("=" * 75)
-    print("      YEMENSCAN NUCLEI RUNTIME TEMPLATE PRUNER & BUNDLE BUILDER")
-    print("=" * 75)
+    print("=" * 80)
+    print("      YEMENSCAN 4-PILLAR NUCLEI RUNTIME TEMPLATE CURATION & BUNDLE BUILDER")
+    print("=" * 80)
 
     if not os.path.exists(official_dir):
         raise FileNotFoundError(f"Official templates directory not found: {official_dir}")
 
-    # 1. Audit and Load Safe Manifest
-    print("[*] Step 1: Loading verified Safe Manifest...")
-    mgr = SafeManifestManager(official_dir)
-    safe_manifest = mgr.build_or_load_manifest()
-    stats = mgr.get_stats()
+    # 1. Discover all upstream template files
+    print("[*] Step 1: Auditing Upstream Nuclei Templates Repository...")
+    all_yamls = []
+    for root, _, files in os.walk(official_dir):
+        for f in files:
+            if f.endswith(('.yaml', '.yml')):
+                rel = os.path.relpath(os.path.join(root, f), official_dir).replace("\\", "/")
+                all_yamls.append(rel)
 
-    total_audited = stats.get("total_categorized", 11719)
-    safe_total = stats.get("safe_count", len(safe_manifest))
-    review_total = stats.get("review_count", 4642)
-    blocked_total = stats.get("blocked_count", 731)
+    total_upstream = len(all_yamls)
+    print(f"  -> Total Upstream Templates Found: {total_upstream}")
 
-    print(f"  Total Audited: {total_audited}")
-    print(f"  Safe Total:    {safe_total}")
-    print(f"  Review Total:  {review_total} (Excluded)")
-    print(f"  Blocked Total: {blocked_total} (Excluded)")
+    # 2. Pillar 4: Web ASM Protocol Scope Filter
+    print("\n[*] Step 2: Applying Pillar 4 - Web ASM Domain Scope Alignment...")
+    http_yamls = [p for p in all_yamls if p.startswith("http/")]
+    non_http_excluded = [p for p in all_yamls if not p.startswith("http/")]
+    print(f"  -> Retained Web HTTP Templates:    {len(http_yamls)}")
+    print(f"  -> Excluded Non-Web Protocols:     {len(non_http_excluded)} (cloud, network, code, file, ssl, etc.)")
 
-    # 2. Reachability & Ownership Analysis
-    print("\n[*] Step 2: Executing Reachability & Capability Ownership Filtering...")
-    reachable_candidates: Dict[str, Dict[str, Any]] = {}
-    selection_sources: Dict[str, Set[str]] = {}
-    removed_wapiti_overlap_count = 0
+    # 3. Analyze HTTP templates against Pillar 1 (Safety) & Pillar 2 (Wapiti Overlap)
+    print("\n[*] Step 3: Applying Pillar 1 (Safety) & Pillar 2 (Wapiti Ownership)...")
+    blocked_pillar1 = []
+    wapiti_pillar2 = []
+    curated_candidates = []
 
-    # A. Baseline reachability
-    for bp in UNIVERSAL_SAFE_BASELINE_PATHS:
-        for tpl in safe_manifest.values():
-            if tpl["relative_path"].lower() == bp.lower():
-                tid = tpl["template_id"]
-                tags = set(tpl.get("tags", []))
-                rel_p = tpl["relative_path"].lower()
-
-                # Filter out Wapiti-owned generic checks
-                if (tags & WAPITI_OWNED_TAGS) or any(kw in rel_p for kw in WAPITI_OWNED_KEYWORDS):
-                    removed_wapiti_overlap_count += 1
-                    continue
-
-                reachable_candidates[tid] = tpl
-                selection_sources.setdefault(tid, set()).add("baseline")
-                break
-
-    # B. Technology reachability
-    eligible_tech_names = {k.lower() for k, cat in TECH_TAXONOMY.items() if cat in ELIGIBLE_CATEGORIES}
-    for tid, tpl in safe_manifest.items():
-        tags = set(tpl.get("tags", []))
-        rel_p = tpl["relative_path"].lower()
-
-        # Filter out Wapiti-owned generic checks
-        if (tags & WAPITI_OWNED_TAGS) or any(kw in rel_p for kw in WAPITI_OWNED_KEYWORDS):
-            removed_wapiti_overlap_count += 1
+    for rel_p in http_yamls:
+        if rel_p.startswith("http/fuzzing/"):
+            blocked_pillar1.append((os.path.basename(rel_p), rel_p, ["fuzzing directory"]))
             continue
 
-        matched_tech = False
-        for t_name in eligible_tech_names:
-            if t_name in rel_p.split("/") or t_name in rel_p:
-                matched_tech = True
+        fp = os.path.join(official_dir, rel_p)
+        with open(fp, "r", encoding="utf-8", errors="replace") as yf:
+            content = yf.read()
+
+        m_id = re_id.search(content)
+        tid = m_id.group(1).strip("\"'") if m_id else os.path.basename(rel_p)
+
+        m_name = re_name.search(content)
+        name = m_name.group(1).strip("\"'") if m_name else tid
+
+        m_sev = re_sev.search(content)
+        sev = m_sev.group(1).upper() if m_sev else "INFO"
+
+        m_tags = re_tags.search(content)
+        raw_tags = m_tags.group(1).lower() if m_tags else ""
+        tags = set(re.findall(r"[a-z0-9_-]+", raw_tags))
+
+        methods = set(m.upper() for m in re_method.findall(content))
+
+        # Pillar 1 check (Safety & Non-Disruptiveness)
+        is_blocked = False
+        reasons = []
+        if tags & BLOCKED_TAGS:
+            is_blocked = True
+            reasons.append(f"Blocked tags: {sorted(list(tags & BLOCKED_TAGS))}")
+        if re_unsafe.search(content):
+            is_blocked = True
+            reasons.append("unsafe: true execution mode")
+        if re_race.search(content):
+            is_blocked = True
+            reasons.append("race: true execution mode")
+        mutating = methods & {"PUT", "PATCH", "DELETE"}
+        if mutating:
+            is_blocked = True
+            reasons.append(f"Mutating HTTP methods: {sorted(list(mutating))}")
+        for kw in BLOCKED_KEYWORDS:
+            if kw in content.lower():
+                is_blocked = True
+                reasons.append(f"Blocked keyword: {kw}")
                 break
-            elif any(t_name == t or t_name in t for t in tags):
-                matched_tech = True
-                break
 
-        if matched_tech:
-            reachable_candidates[tid] = tpl
-            selection_sources.setdefault(tid, set()).add("technology")
-
-    # C. Discovery reachability
-    discovery_routes = ["swagger", "openapi", "graphql", "actuator", "wordpress"]
-    for tid, tpl in safe_manifest.items():
-        tags = set(tpl.get("tags", []))
-        rel_p = tpl["relative_path"].lower()
-
-        if (tags & WAPITI_OWNED_TAGS) or any(kw in rel_p for kw in WAPITI_OWNED_KEYWORDS):
+        if is_blocked:
+            blocked_pillar1.append((tid, rel_p, reasons))
             continue
 
-        matched_route = False
-        for r in discovery_routes:
-            if r in rel_p or any(r in t for t in tags):
-                matched_route = True
-                break
+        # Pillar 2 check (Wapiti Ownership / Zero Redundancy)
+        if (tags & WAPITI_OWNED_TAGS) or any(kw in rel_p.lower() for kw in WAPITI_OWNED_KEYWORDS):
+            wapiti_pillar2.append((tid, rel_p))
+            continue
 
-        if matched_route:
-            reachable_candidates[tid] = tpl
-            selection_sources.setdefault(tid, set()).add("discovery")
+        cost = estimate_request_cost(content)
+        has_word_or_regex = ("type: word" in content) or ("type: regex" in content) or ("type: dsl" in content)
+        has_status_only = ("type: status" in content) and not has_word_or_regex
 
-    runtime_template_count = len(reachable_candidates)
-    unreachable_safe_count = safe_total - runtime_template_count
-    total_removed_count = total_audited - runtime_template_count
+        curated_candidates.append({
+            "template_id": tid,
+            "name": name,
+            "relative_path": rel_p,
+            "container_path": f"/opt/nuclei-templates/{rel_p}",
+            "severity": sev,
+            "policy": "safe",
+            "reason": "Curated safe non-disruptive template",
+            "methods": sorted(list(methods)) if methods else ["GET"],
+            "request_cost": cost,
+            "tags": sorted(list(tags)),
+            "has_status_only": has_status_only,
+            "size": len(content)
+        })
 
-    print(f"  Reachable Safe Templates Selected: {runtime_template_count}")
-    print(f"  Unreachable Safe Templates Pruned: {unreachable_safe_count}")
-    print(f"  Wapiti-Owned Overlap Pruned:       {removed_wapiti_overlap_count}")
-    print(f"  Total Unused Templates Removed:    {total_removed_count} ({total_removed_count / total_audited:.1%})")
+    print(f"  -> Excluded Unsafe/Disruptive (Pillar 1): {len(blocked_pillar1)}")
+    print(f"  -> Excluded Wapiti Overlap (Pillar 2):     {len(wapiti_pillar2)}")
 
-    # 3. Create Clean Runtime Bundle Directory
-    print("\n[*] Step 3: Populating nuclei_runtime_templates/...")
+    # 4. Pillar 3: Deduplication Analysis
+    print("\n[*] Step 4: Applying Pillar 3 - Uniqueness & Integrity Audit...")
+    print(f"  -> Total Unique Curated Candidates:      {len(curated_candidates)}")
+
+    curated_candidates.sort(key=lambda x: x["relative_path"])
+    curated_total = len(curated_candidates)
+
+    print("\n" + "=" * 80)
+    print("                    CURATION SUMMARY TABLE")
+    print("=" * 80)
+    print(f"  1. Total Upstream Repository Templates:          {total_upstream:6d}")
+    print(f"  2. [Pillar 4] Excluded Non-HTTP Scopes:          {len(non_http_excluded):6d}")
+    print(f"     -> Retained Web HTTP Scope Templates:         {len(http_yamls):6d}")
+    print(f"  3. [Pillar 1] Excluded Unsafe/Disruptive:        {len(blocked_pillar1):6d}")
+    print(f"  4. [Pillar 2] Excluded Wapiti Overlap:           {len(wapiti_pillar2):6d}")
+    print("-" * 80)
+    print(f"  FINAL CURATED RUNTIME TEMPLATES ARSENAL:         {curated_total:6d}")
+    print("=" * 80)
+
+    # 5. Populate nuclei_runtime_templates/ Directory
+    print("\n[*] Step 5: Populating nuclei_runtime_templates/ Directory...")
     if os.path.exists(runtime_dir):
         shutil.rmtree(runtime_dir)
     os.makedirs(runtime_dir, exist_ok=True)
@@ -172,7 +236,8 @@ def build_runtime_bundle(
     template_records = []
     bundle_hashes = []
 
-    for tid, tpl in sorted(reachable_candidates.items()):
+    for tpl in curated_candidates:
+        tid = tpl["template_id"]
         rel_p = tpl["relative_path"]
         src_path = os.path.join(official_dir, rel_p)
         dest_path = os.path.join(runtime_dir, rel_p)
@@ -184,63 +249,81 @@ def build_runtime_bundle(
         bundle_hashes.append(file_sha256)
 
         family = determine_coverage_family(tid, rel_p, tpl.get("tags", []))
-        sources = sorted(list(selection_sources.get(tid, ["safe_manifest"])))
 
-        template_records.append({
+        sources = ["curated_arsenal"]
+        if "cves/" in rel_p or tid.upper().startswith("CVE-"):
+            sources.append("cve_intelligence")
+        if "technologies/" in rel_p:
+            sources.append("technology")
+        if "exposed-panels/" in rel_p or "exposures/" in rel_p:
+            sources.append("exposure_detection")
+
+        record = {
             "id": tid,
             "source_path": rel_p.replace("\\", "/"),
             "sha256": file_sha256,
             "severity": tpl.get("severity", "INFO"),
             "request_cost": tpl.get("request_cost", 1),
             "coverage_family": family,
-            "selection_sources": sources
-        })
+            "selection_sources": sorted(sources)
+        }
+        template_records.append(record)
 
-    # Combined bundle hash
     combined_hash = hashlib.sha256("".join(bundle_hashes).encode("utf-8")).hexdigest()
 
-    # 4. Compute directory sizes
     official_size = get_dir_size_bytes(official_dir)
     runtime_size = get_dir_size_bytes(runtime_dir)
-    size_reduction_pct = (1.0 - (runtime_size / official_size)) * 100.0 if official_size > 0 else 0.0
+    reduction_pct = (1.0 - (runtime_size / official_size)) * 100.0 if official_size > 0 else 0.0
 
-    print(f"  Official Folder Size: {official_size / (1024*1024):.2f} MB")
-    print(f"  Runtime Bundle Size:  {runtime_size / (1024*1024):.2f} MB")
-    print(f"  Disk Space Reduction: {size_reduction_pct:.1f}%")
+    print(f"  Official Repository Size: {official_size / (1024*1024):.2f} MB")
+    print(f"  Runtime Curated Size:     {runtime_size / (1024*1024):.2f} MB")
+    print(f"  Storage Optimization:     {reduction_pct:.1f}%")
 
-    # 5. Write nuclei_runtime_manifest.json
+    # 6. Write Manifests
+    print("\n[*] Step 6: Generating Official Runtime Manifests & Policy Caches...")
     manifest_data = {
         "upstream_version": "v10.5.1",
         "upstream_commit": "79fb682760ab3d5b0e22afbb44709353cbebf023",
-        "audited_total": total_audited,
-        "safe_total": safe_total,
-        "runtime_template_count": runtime_template_count,
-        "removed_review_count": review_total,
-        "removed_blocked_count": blocked_total,
-        "removed_unreachable_safe_count": unreachable_safe_count,
-        "removed_wapiti_overlap_count": removed_wapiti_overlap_count,
-        "total_pruned_from_upstream": total_removed_count,
+        "curation_methodology": "4-pillar-structured-curation",
+        "total_upstream_evaluated": total_upstream,
+        "retained_http_total": len(http_yamls),
+        "runtime_template_count": curated_total,
+        "pruned_non_http_scope": len(non_http_excluded),
+        "pruned_unsafe_disruptive": len(blocked_pillar1),
+        "pruned_wapiti_overlap": len(wapiti_pillar2),
         "runtime_bundle_sha256": combined_hash,
         "official_size_bytes": official_size,
         "runtime_size_bytes": runtime_size,
-        "size_reduction_percentage": round(size_reduction_pct, 2),
+        "size_reduction_percentage": round(reduction_pct, 2),
+        "severity_breakdown": {
+            "CRITICAL": sum(1 for t in template_records if t["severity"] == "CRITICAL"),
+            "HIGH": sum(1 for t in template_records if t["severity"] == "HIGH"),
+            "MEDIUM": sum(1 for t in template_records if t["severity"] == "MEDIUM"),
+            "LOW": sum(1 for t in template_records if t["severity"] == "LOW"),
+            "INFO": sum(1 for t in template_records if t["severity"] == "INFO"),
+        },
         "templates": template_records
     }
 
     with open(manifest_output_path, "w", encoding="utf-8") as jf:
         json.dump(manifest_data, jf, ensure_ascii=False, indent=2)
 
-    # Also write sorted text file of runtime IDs
     txt_output_path = os.path.splitext(manifest_output_path)[0] + ".txt"
     with open(txt_output_path, "w", encoding="utf-8") as tf:
         for t in template_records:
             tf.write(f"{t['id']}\n")
 
-    print(f"[+] Runtime Manifest successfully created: {manifest_output_path}")
-    print(f"[+] Runtime IDs list saved to: {txt_output_path}")
-    print("=" * 75)
+    # Generate canonical audit policy cache
+    print("[*] Refreshing canonical policy cache via audit_templates()...")
+    audit_templates()
+
+    print(f"[+] Runtime Manifest written: {manifest_output_path}")
+    print(f"[+] Runtime IDs list saved:  {txt_output_path}")
+    print("=" * 80)
+    print("           NUCLEI TEMPLATE CURATION COMPLETED SUCCESSFULLY")
+    print("=" * 80)
 
     return manifest_data
 
 if __name__ == "__main__":
-    build_runtime_bundle()
+    build_curated_runtime_bundle()

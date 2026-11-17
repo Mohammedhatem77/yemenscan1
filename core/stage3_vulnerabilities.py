@@ -178,7 +178,7 @@ def write_nuclei_template_manifest(session_dir: str) -> Dict[str, Any]:
         "request_budget": 500
     }
 
-    # Write safe manifest files if official templates exist
+    # Extract policy stats if official templates exist
     try:
         mgr = SafeManifestManager(NUCLEI_TEMPLATES_OFFICIAL_DIR)
         safe_map = mgr.build_or_load_manifest()
@@ -188,7 +188,6 @@ def write_nuclei_template_manifest(session_dir: str) -> Dict[str, Any]:
         manifest["blocked_policy_count"] = stats.get("blocked_count", 0)
         manifest["total_templates_evaluated"] = stats.get("total_categorized", 0)
         manifest["invariant_holds"] = stats.get("invariant_holds", True)
-        mgr.write_manifest_files(session_dir)
     except Exception as e:
         print(f"[-] ملاحظة: تعذر استخراج manifest الآمن: {e}", flush=True)
 
@@ -1254,6 +1253,21 @@ def run_nuclei(
                     for line in prf:
                         if line.strip():
                             crf.write(line.strip() + "\n")
+            try:
+                os.remove(profile_raw_path)
+            except Exception:
+                pass
+
+        # Clean temporary profile-specific targets and template files
+        try:
+            ptf_path = os.path.join(session_dir, targets_filename)
+            if os.path.exists(ptf_path):
+                os.remove(ptf_path)
+            ptlf_path = os.path.join(session_dir, tpls_filename)
+            if os.path.exists(ptlf_path):
+                os.remove(ptlf_path)
+        except Exception:
+            pass
 
     duration = time.time() - start_time
 
@@ -1350,6 +1364,17 @@ def run_nuclei(
             progress=85,
             log_message=f"اكتمل فحص Nuclei التكيفي الآمن: تم فحص {summary.get('selected_template_count', 0)} قوالب بنجاح، ورصد {len(parsed_findings)} ملاحظة وثغرة أمنية."
         )
+
+    # Clean any residual profile-specific temporary files
+    try:
+        for f in os.listdir(session_dir):
+            if f.startswith(("selected_templates_profile-", "nuclei_targets_profile-", "nuclei_raw_profile-")):
+                try:
+                    os.remove(os.path.join(session_dir, f))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     return True, parsed_findings
 
@@ -1764,6 +1789,17 @@ def run_wapiti_dast(
     combined_raw_path = os.path.join(session_dir, "wapiti_raw.json")
     with open(combined_raw_path, "w", encoding="utf-8") as cf:
         json.dump(combined_raw, cf, ensure_ascii=False, indent=2)
+
+    # Clean up intermediate wapiti raw files now that combined_raw is saved
+    try:
+        for fname in os.listdir(session_dir):
+            if fname.startswith("wapiti_raw_") and fname.endswith(".json"):
+                try:
+                    os.remove(os.path.join(session_dir, fname))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     findings_file = os.path.join(session_dir, "wapiti_findings.json")
     with open(findings_file, "w", encoding="utf-8") as ff:

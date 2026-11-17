@@ -724,6 +724,40 @@ class TestNucleiWapitiIntegration(unittest.TestCase):
         self.assertIn("no-form-submission-safe-profile", wp["patches"])
         self.assertEqual(wp["version"], "3.3.2")
 
+    # 46. Evidence packaging and unified metadata consolidation
+    def test_46_package_session_evidence_and_metadata(self):
+        from core.pipeline import package_session_evidence_and_metadata
+        with open(os.path.join(self.test_dir, "subfinder_raw.jsonl"), "w") as f:
+            f.write('{"host":"api.example.com"}\n')
+        with open(os.path.join(self.test_dir, "nuclei_raw.jsonl"), "w") as f:
+            f.write('{"template-id":"cve-1"}\n')
+        with open(os.path.join(self.test_dir, "nuclei_metadata.json"), "w") as f:
+            json.dump({"tool": "nuclei", "finding_count": 1}, f)
+
+        package_session_evidence_and_metadata(
+            session_dir=self.test_dir,
+            scan_id=self.scan_id,
+            domain="example.com",
+            final_status="completed",
+            tool_statuses={"subfinder": "success", "nuclei": "success"}
+        )
+
+        meta_path = os.path.join(self.test_dir, "scan_metadata.json")
+        self.assertTrue(os.path.exists(meta_path))
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        self.assertEqual(meta["final_status"], "completed")
+        self.assertEqual(meta["target_domain"], "example.com")
+        self.assertEqual(meta["tools"]["nuclei"]["finding_count"], 1)
+
+        evidence_dir = os.path.join(self.test_dir, "raw_evidence")
+        self.assertTrue(os.path.exists(evidence_dir))
+        self.assertTrue(os.path.exists(os.path.join(evidence_dir, "subfinder_raw.jsonl")))
+        self.assertTrue(os.path.exists(os.path.join(evidence_dir, "nuclei_raw.jsonl")))
+        # Verify root is cleanly uncluttered (files moved to raw_evidence)
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "subfinder_raw.jsonl")))
+        self.assertFalse(os.path.exists(os.path.join(self.test_dir, "nuclei_raw.jsonl")))
+
 if __name__ == "__main__":
     unittest.main()
 

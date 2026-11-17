@@ -416,7 +416,12 @@ class SafeManifestManager:
     BANNED_PROTOCOLS: Set[str] = {"code", "javascript", "headless", "dast", "file"}
 
     def __init__(self, templates_dir: Optional[str] = None):
-        self.templates_dir = templates_dir or NUCLEI_TEMPLATES_OFFICIAL_DIR
+        if templates_dir and os.path.exists(templates_dir):
+            self.templates_dir = templates_dir
+        elif os.path.exists(NUCLEI_RUNTIME_TEMPLATES_DIR):
+            self.templates_dir = NUCLEI_RUNTIME_TEMPLATES_DIR
+        else:
+            self.templates_dir = templates_dir or NUCLEI_TEMPLATES_OFFICIAL_DIR
         self._safe_templates: Dict[str, Dict[str, Any]] = {}
         self._review_templates: Dict[str, Dict[str, Any]] = {}
         self._blocked_templates: Dict[str, Dict[str, Any]] = {}
@@ -429,6 +434,10 @@ class SafeManifestManager:
             return self._safe_templates
 
         cache_policy_path = os.path.join(self.templates_dir, ".cache_policy_manifest.json")
+        if not os.path.exists(cache_policy_path):
+            alt_path = os.path.join(NUCLEI_RUNTIME_TEMPLATES_DIR, ".cache_policy_manifest.json")
+            if os.path.exists(alt_path):
+                cache_policy_path = alt_path
         if os.path.exists(cache_policy_path):
             try:
                 with open(cache_policy_path, "r", encoding="utf-8") as cf:
@@ -879,7 +888,6 @@ def generate_nuclei_scan_plan(
         api_endpoints_file = os.path.join(session_dir, "api_endpoints.txt")
 
     manifest_mgr = SafeManifestManager()
-    manifest_mgr.write_manifest_files(session_dir)
     selector = AdaptiveTemplateSelector(manifest_mgr)
 
     # 1. Load active_urls_records

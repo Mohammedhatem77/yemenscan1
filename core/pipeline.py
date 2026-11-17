@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import shutil
 from typing import Dict, Any, List
 from core.session import get_session_dir, update_status
 from core.runner import is_scan_cancelled, ScanCancelledException
@@ -14,6 +16,87 @@ from core.stage3_vulnerabilities import (
 )
 from core.scope_classifier import load_scoped_urls
 from core.execution_engine import _run_nuclei_takeover_check
+
+def package_session_evidence_and_metadata(
+    session_dir: str,
+    scan_id: str,
+    domain: str,
+    final_status: str,
+    tool_statuses: Dict[str, str]
+) -> None:
+    """
+    Consolidates individual tool metadata into a unified scan_metadata.json
+    and packages forensic raw outputs into a raw_evidence/ subfolder.
+    Preserves existing files for backward-compatibility while organizing evidence.
+    """
+    try:
+        # 1. Consolidate metadata from all 6 tools
+        tool_metas: Dict[str, Any] = {}
+        meta_map = {
+            "subfinder": "subfinder_metadata.json",
+            "naabu": "naabu_metadata.json",
+            "httpx": "httpx_metadata.json",
+            "kiterunner": "kiterunner_metadata.json",
+            "nuclei": "nuclei_metadata.json",
+            "wapiti": "wapiti_metadata.json"
+        }
+        for tool, fname in meta_map.items():
+            fpath = os.path.join(session_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as mf:
+                        tool_metas[tool] = json.load(mf)
+                except Exception:
+                    tool_metas[tool] = {"status": tool_statuses.get(tool, "unknown")}
+            elif tool in tool_statuses:
+                tool_metas[tool] = {"status": tool_statuses[tool]}
+
+        unified_meta = {
+            "scan_id": scan_id,
+            "target_domain": domain,
+            "final_status": final_status,
+            "tool_statuses": tool_statuses,
+            "tools": tool_metas
+        }
+        meta_path = os.path.join(session_dir, "scan_metadata.json")
+        with open(meta_path, "w", encoding="utf-8") as out_m:
+            json.dump(unified_meta, out_m, ensure_ascii=False, indent=2)
+
+        # 2. Package raw evidence logs into raw_evidence/
+        evidence_dir = os.path.join(session_dir, "raw_evidence")
+        raw_evidence_files = [
+            "subfinder_raw.jsonl",
+            "naabu_raw.jsonl",
+            "httpx_raw.jsonl",
+            "kiterunner_raw.jsonl",
+            "nuclei_raw.jsonl",
+            "wapiti_raw.json",
+            "nuclei_stderr.log",
+            "kiterunner_stderr.log"
+        ]
+        has_evidence = any(os.path.exists(os.path.join(session_dir, f)) for f in raw_evidence_files)
+        if has_evidence:
+            os.makedirs(evidence_dir, exist_ok=True)
+            for rf in raw_evidence_files:
+                src = os.path.join(session_dir, rf)
+                if os.path.exists(src):
+                    try:
+                        shutil.move(src, os.path.join(evidence_dir, rf))
+                    except Exception:
+                        pass
+
+        # 3. Clean any residual intermediate files (e.g. wapiti_raw_*.json)
+        try:
+            for fname in os.listdir(session_dir):
+                if fname.startswith("wapiti_raw_") and fname.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(session_dir, fname))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[-] ملاحظة: تعذر أرشفة الأدلة الخام والميتاداتا: {e}", flush=True)
 
 def run_full_pipeline(domain: str, scan_id: str) -> None:
     """
@@ -206,6 +289,15 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
             final_status = "completed"
             has_error = False
             msg = "اكتمل الفحص الأمني الشامل بنجاح."
+
+        # Consolidate metadata and package raw evidence
+        package_session_evidence_and_metadata(
+            session_dir=session_dir,
+            scan_id=scan_id,
+            domain=domain,
+            final_status=final_status,
+            tool_statuses=tool_statuses
+        )
 
         update_status(
             scan_id,
