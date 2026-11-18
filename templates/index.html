@@ -1201,6 +1201,7 @@
                     </button>
                 </div>
             </div>
+            <div id="vulnTriageBox" style="display:none; margin-bottom: 1.25rem;"></div>
             <div class="card-table">
                 <table id="vulnsTable">
                     <thead>
@@ -1634,7 +1635,9 @@
             document.getElementById('apisTableBody').innerHTML = '<tr><td colspan="4" class="empty-state">جاري التحميل...</td></tr>';
             const diagBox = document.getElementById('apiDiagnosticBox');
             if (diagBox) { diagBox.style.display = 'none'; diagBox.innerHTML = ''; }
-            document.getElementById('vulnsTableBody').innerHTML = '<tr><td colspan="5" class="empty-state">جاري التحميل...</td></tr>';
+            const triageBox = document.getElementById('vulnTriageBox');
+            if (triageBox) { triageBox.style.display = 'none'; triageBox.innerHTML = ''; }
+            document.getElementById('vulnsTableBody').innerHTML = '<tr><td colspan="6" class="empty-state">جاري التحميل...</td></tr>';
             document.getElementById('logsBox').innerHTML = '<div>[SYSTEM] جاري تحميل بيانات الجلسة...</div>';
         }
 
@@ -1953,7 +1956,39 @@
                 const res = await fetch(`${API_BASE}/api/scan/${currentScanId}/vulnerabilities`);
                 const data = await res.json();
                 const vBody = document.getElementById('vulnsTableBody');
+                const triageBox = document.getElementById('vulnTriageBox');
                 const vulnsList = data.vulnerabilities || data.data || [];
+                const triageSuppressed = Number(data.triage_suppressed_count || 0);
+                const triageCanon = Number(data.triage_canonicalized_count || 0);
+                const triageSummary = data.triage_summary || '';
+
+                if (triageBox) {
+                    if ((triageSuppressed > 0 || triageCanon > 0) && triageSummary) {
+                        const isCleanZero = vulnsList.length === 0;
+                        const borderCol = isCleanZero ? 'rgba(16, 185, 129, 0.4)' : 'rgba(14, 165, 233, 0.4)';
+                        const bgCol = isCleanZero ? 'rgba(16, 185, 129, 0.08)' : 'rgba(14, 165, 233, 0.08)';
+                        const titleCol = isCleanZero ? '#34d399' : '#38bdf8';
+                        const headerTitle = isCleanZero
+                            ? 'نتيجة التحقق الذكي (Smart Triage): الموقع محمي (0 ثغرات حقيقية)'
+                            : `نتيجة التحقق الذكي (Smart Triage): تم تنقية ${triageSuppressed} تنبيهات كاذبة تلقائياً`;
+                        triageBox.style.display = 'block';
+                        triageBox.innerHTML = `
+                            <div style="background: ${bgCol}; border: 1.5px solid ${borderCol}; border-radius: 10px; padding: 1.1rem 1.25rem; box-shadow: 0 4px 15px rgba(0,0,0,0.25);">
+                                <div style="display: flex; align-items: center; gap: 8px; font-weight: bold; color: ${titleCol}; font-size: 1.02rem; margin-bottom: 6px;">
+                                    <span style="font-size: 1.25rem;">🛡️</span>
+                                    <span>${headerTitle}</span>
+                                </div>
+                                <div style="color: #e2e8f0; font-size: 0.9rem; line-height: 1.65;">
+                                    <strong style="color: #94a3b8;">التشخيص والسبب التقني:</strong> ${triageSummary}
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        triageBox.style.display = 'none';
+                        triageBox.innerHTML = '';
+                    }
+                }
+
                 if (vulnsList.length > 0) {
                     vBody.innerHTML = vulnsList.map(v => {
                         const sevClass = 'badge-' + (v.severity ? v.severity.toLowerCase() : 'info');
@@ -1970,11 +2005,13 @@
                                     <div style="color:var(--text-muted); font-size:0.8rem; margin-top:4px;">${v.description}</div>
                                 </td>
                                 <td><span style="color:#818cf8;">${v.source}</span><br><small style="color:#38bdf8; font-weight:600;">🏷️ ${v.owasp_category || v.category}</small></td>
-                                <td><code style="color:#38bdf8;">${v.url}</code></td>
+                                <td dir="ltr" style="text-align: left;"><code style="color:#38bdf8;">${v.url}</code></td>
                                 <td><div class="remediation-box">🛠️ ${v.remediation}</div></td>
                             </tr>
                         `;
                     }).join('');
+                } else {
+                    vBody.innerHTML = '<tr><td colspan="6" class="empty-state">لا توجد ثغرات أمنية حقيقية مكتشفة في هذه الجلسة.</td></tr>';
                 }
             } catch (e) {}
         }
