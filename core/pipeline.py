@@ -206,9 +206,13 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
 
         # ── Scope Guard: عزل أصول الطرف الثالث وتطبيق نطاق الفحص الصارم ──
         scoped = load_scoped_urls(session_dir)
-        in_scope_urls    = scoped["in_scope_urls"]
-        third_party_urls = scoped["third_party_urls"]
-        excluded_count   = scoped["excluded_count"]
+        in_scope_urls    = scoped.get("in_scope_urls") or []
+        third_party_urls = scoped.get("third_party_urls") or []
+        excluded_count   = scoped.get("excluded_count") or 0
+
+        # Fallback to active_urls if scoped list is empty
+        if not in_scope_urls and active_urls:
+            in_scope_urls = [u for u in active_urls if u]
 
         if excluded_count > 0:
             print(

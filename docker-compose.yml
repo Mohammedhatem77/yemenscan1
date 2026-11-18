@@ -14,6 +14,15 @@ services:
     volumes:
       - postgres_data_v2:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    pull_policy: if_not_present
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
   web:
     build: .
     image: yemenscan1-web:latest
@@ -22,7 +31,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://yemenscan_user:yemenscan_secure_password123@db:5432/yemenscan_db
+      - DATABASE_URL=postgresql+psycopg2://yemenscan_user:yemenscan_secure_password123@db:5432/yemenscan_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - GEMINI_API_KEY=AQ.Ab8RN6LIIf8hFT0LClX813K73P-xubA1a2Riy4D90jSK2zDPrA
       - PREFER_LOCAL_TOOLS=false
       - YEMENSCAN_USE_DOCKER=true
@@ -35,10 +47,64 @@ services:
       - ./nuclei_templates:/app/nuclei_templates
       - ./templates:/app/templates
       - ./main.py:/app/main.py
+      - ./database.py:/app/database.py
+      - ./models.py:/app/models.py
+      - ./init_db.py:/app/init_db.py
       - ./core:/app/core
     depends_on:
       - db
+      - redis
+
+  worker:
+    image: yemenscan1-web:latest
+    pull_policy: build
+    restart: unless-stopped
+    command: celery -A core.tasks worker -E --loglevel=info --concurrency=2
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://yemenscan_user:yemenscan_secure_password123@db:5432/yemenscan_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - GEMINI_API_KEY=AQ.Ab8RN6LIIf8hFT0LClX813K73P-xubA1a2Riy4D90jSK2zDPrA
+      - PREFER_LOCAL_TOOLS=false
+      - YEMENSCAN_USE_DOCKER=true
+      - WAPITI_ALLOW_LOCAL_BUILD=${WAPITI_ALLOW_LOCAL_BUILD:-true}
+      - HOST_PROJECT_DIR=${HOST_PROJECT_DIR:-${PWD}}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scans:/app/scans
+      - ./nuclei_templates:/app/nuclei_templates
+      - ./templates:/app/templates
+      - ./main.py:/app/main.py
+      - ./database.py:/app/database.py
+      - ./models.py:/app/models.py
+      - ./init_db.py:/app/init_db.py
+      - ./core:/app/core
+    depends_on:
+      - db
+      - redis
+
+  flower:
+    image: yemenscan1-web:latest
+    pull_policy: build
+    restart: unless-stopped
+    command: celery -A core.tasks flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://yemenscan_user:yemenscan_secure_password123@db:5432/yemenscan_db
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - FLOWER_UNAUTHENTICATED_API=true
+    volumes:
+      - ./core:/app/core
+      - ./scans:/app/scans
+    depends_on:
+      - redis
 
 volumes:
   postgres_data_v2:
+    driver: local
+  redis_data:
     driver: local

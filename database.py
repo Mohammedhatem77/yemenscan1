@@ -22,10 +22,24 @@ RAW_DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 def _resolve_database_engine():
     global DATABASE_URL
-    if RAW_DATABASE_URL:
-        db_url = RAW_DATABASE_URL
+    raw_url = os.getenv("DATABASE_URL", RAW_DATABASE_URL).strip()
+    if raw_url:
+        db_url = raw_url
     else:
         db_url = "sqlite:///yemenscan.db"
+
+    # Automatically adapt generic postgresql:// to postgresql+psycopg2:// for SQLAlchemy 2.0+
+    if db_url.startswith("postgresql://"):
+        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
+
+    # Auto-adapt localhost -> db when running inside Docker container network
+    if "localhost:5432" in db_url or "127.0.0.1:5432" in db_url:
+        try:
+            import socket
+            socket.gethostbyname("db")
+            db_url = db_url.replace("localhost:5432", "db:5432").replace("127.0.0.1:5432", "db:5432")
+        except Exception:
+            pass
 
     DATABASE_URL = db_url
 
