@@ -38,18 +38,27 @@ from core.pipeline import run_full_pipeline
 from core.target_validator import validate_target_domain, TargetValidationError
 from core.target_prioritizer import prioritize_hosts, prioritize_ports, prioritize_urls, prioritize_dict_records
 from core.scope_classifier import build_scope_badge
+from core.tasks import (
+    dispatch_scan_pipeline,
+    dispatch_stage1,
+    dispatch_stage2,
+    dispatch_stage3,
+    dispatch_tool,
+)
 
 from datetime import datetime
 
 # Safe environment loading for Google Gemini API
 def get_gemini_api_key() -> Optional[str]:
     """Dynamically and securely fetches GEMINI_API_KEY from environment or .env file."""
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(override=True)
-    except Exception:
-        pass
     key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(override=False)
+            key = os.getenv("GEMINI_API_KEY")
+        except Exception:
+            pass
     if not key:
         env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         if os.path.exists(env_file):
@@ -61,7 +70,6 @@ def get_gemini_api_key() -> Optional[str]:
                             k = line.split("=", 1)[1].strip().strip('"').strip("'")
                             if k:
                                 key = k
-                                os.environ["GEMINI_API_KEY"] = k
                                 break
             except Exception:
                 pass
@@ -341,8 +349,8 @@ def start_scan(
 
     print(f"\n[*] تم التحقق بنجاح من النطاق ({clean_domain} -> {resolved_ips}). تشغيل أدوات الفحص في الخلفية...", flush=True)
     
-    # 3. Pass to background execution
-    background_tasks.add_task(run_scan_pipeline_and_ingest, clean_domain, scan_id)
+    # 3. Pass to distributed execution (Celery worker with BackgroundTasks fallback)
+    dispatch_scan_pipeline(clean_domain, scan_id, background_tasks=background_tasks)
     
     return {
         "status": "success",
@@ -428,7 +436,7 @@ def run_stage1_endpoint(
     if not domain:
         raise HTTPException(status_code=400, detail="يرجى إرسال النطاق المستهدف للمرحلة الأولى.")
 
-    background_tasks.add_task(run_stage1_pipeline, scan_id, domain)
+    dispatch_stage1(scan_id, domain, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,
@@ -445,7 +453,7 @@ def run_stage2_endpoint(scan_id: str, background_tasks: BackgroundTasks):
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
 
-    background_tasks.add_task(run_stage2_pipeline, scan_id)
+    dispatch_stage2(scan_id, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,
@@ -461,7 +469,7 @@ def run_stage3_endpoint(scan_id: str, background_tasks: BackgroundTasks):
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
 
-    background_tasks.add_task(run_stage3_pipeline, scan_id)
+    dispatch_stage3(scan_id, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,
@@ -490,7 +498,7 @@ def run_session_tool_endpoint(
         )
 
     opts = req.options if req else {}
-    background_tasks.add_task(run_tool_in_session, scan_id, tool_name.lower(), opts)
+    dispatch_tool(scan_id, tool_name.lower(), opts, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,

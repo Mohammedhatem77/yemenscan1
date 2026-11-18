@@ -10,7 +10,10 @@ __pycache__/
 node_modules/
 frontend/node_modules/
 frontend/dist/
-scans/.tmp/
+scans/
+nuclei_templates_official/
+nuclei_templates/
+*.tar.gz
 yemenscan.db
 .DS_Store
 Thumbs.db

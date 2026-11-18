@@ -80,6 +80,14 @@ def migrate_schema() -> bool:
             "CREATE INDEX IF NOT EXISTS ix_vulnerability_findings_source ON vulnerability_findings (source);",
             "CREATE INDEX IF NOT EXISTS ix_assets_asset_type ON assets (asset_type);",
             "CREATE INDEX IF NOT EXISTS ix_system_settings_key ON system_settings (key);",
+            # Synchronize sequences after migrations/imports
+            "SELECT setval(pg_get_serial_sequence('targets', 'id'), COALESCE(max(id), 1)) FROM targets;",
+            "SELECT setval(pg_get_serial_sequence('scan_sessions', 'id'), COALESCE(max(id), 1)) FROM scan_sessions;",
+            "SELECT setval(pg_get_serial_sequence('assets', 'id'), COALESCE(max(id), 1)) FROM assets;",
+            "SELECT setval(pg_get_serial_sequence('vulnerability_catalog', 'id'), COALESCE(max(id), 1)) FROM vulnerability_catalog;",
+            "SELECT setval(pg_get_serial_sequence('vulnerability_findings', 'id'), COALESCE(max(id), 1)) FROM vulnerability_findings;",
+            "SELECT setval(pg_get_serial_sequence('ai_reports', 'id'), COALESCE(max(id), 1)) FROM ai_reports;",
+            "SELECT setval(pg_get_serial_sequence('system_settings', 'id'), COALESCE(max(id), 1)) FROM system_settings;",
         ]
 
         with engine.begin() as conn:

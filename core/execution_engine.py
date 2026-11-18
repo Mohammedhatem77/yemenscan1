@@ -52,13 +52,10 @@ def _run_nuclei_takeover_check(
             fh.write(f"{u}\n")
 
     out_file = os.path.join(session_dir, "nuclei_takeover_findings.jsonl")
-    container_input  = "/nuclei_input/takeover_targets.txt"
-    container_output = "/nuclei_input/takeover_findings.jsonl"
+    container_input  = "/data/takeover_targets.txt"
+    container_output = "/data/nuclei_takeover_findings.jsonl"
 
     docker_args = [
-        "run", "--rm",
-        "-v", f"{session_dir}:/nuclei_input",
-        _NUCLEI_TAKEOVER_IMAGE,
         "-l", container_input,
         "-tags", "takeover",
         "-severity", "critical,high,medium",
@@ -69,7 +66,12 @@ def _run_nuclei_takeover_check(
 
     findings: List[Dict[str, Any]] = []
     try:
-        ok, stdout, stderr = run_docker_tool(docker_args, timeout=300)
+        ok, output = run_docker_tool(
+            image=_NUCLEI_TAKEOVER_IMAGE,
+            args=docker_args,
+            volume_dir=session_dir,
+            timeout=300
+        )
         if os.path.exists(out_file):
             with open(out_file, "r", encoding="utf-8", errors="replace") as rf:
                 for line in rf:
