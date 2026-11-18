@@ -2205,21 +2205,7 @@
                 if (data.status === 'success') {
                     renderStandaloneResults(currentStandaloneTool, data);
                 } else {
-                    const errMsg = data.detail || data.message || data.error || 'خطأ غير معروف في تنفيذ الأداة.';
-                    if (body) {
-                        body.innerHTML = `
-                            <tr>
-                                <td colspan="6" style="padding: 24px; text-align: center; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.2); border-radius: 8px;">
-                                    <div style="font-size: 1.1rem; font-weight: 600; color: #f87171; margin-bottom: 8px;">
-                                        ❌ تعذر إتمام فحص أداة ${cfg.name}
-                                    </div>
-                                    <div style="color: #cbd5e1; font-size: 0.95rem; line-height: 1.6; max-width: 650px; margin: 0 auto;">
-                                        ${errMsg}
-                                    </div>
-                                </td>
-                            </tr>
-                        `;
-                    }
+                    if (body) body.innerHTML = `<tr><td colspan="6" class="empty-state" style="color:#ef4444;">❌ حدث خطأ أثناء تشغيل أداة ${cfg.name}: ${data.detail || data.message || 'خطأ غير معروف'}</td></tr>`;
                 }
             } catch (err) {
                 if (loading) loading.style.display = 'none';
