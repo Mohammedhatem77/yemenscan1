@@ -10,9 +10,12 @@ Discovers the real backend server (Origin IP) behind Web Application Firewalls
 import socket
 import ipaddress
 import logging
+import re
 from typing import Dict, Any, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 import requests
+
+from core.scope_classifier import KNOWN_PROVIDERS, is_domain_matching_root, clean_domain
 
 logger = logging.getLogger("yemenscan.origin_recon")
 
@@ -147,10 +150,52 @@ def detect_waf_presence(domain: str) -> Dict[str, Any]:
     }
 
 
-def find_candidate_origin_ips(domain: str) -> List[str]:
+def is_candidate_subdomain_in_scope(sub_fqdn: str, root_domain: str) -> bool:
+    """
+    Scope Guard Pre-Filter:
+    Checks if candidate subdomain points via CNAME or DNS aliases to an external
+    third-party SaaS provider (e.g. Google, Shopify, AWS, Zendesk).
+    Prevents out-of-scope external infrastructure from being targeted as an Origin IP.
+    """
+    clean_root = clean_domain(root_domain)
+    try:
+        hostname, aliases, _ = socket.gethostbyname_ex(sub_fqdn)
+        candidates_to_check = [hostname] + aliases
+        for cand in candidates_to_check:
+            c = clean_domain(cand)
+            if c and not is_domain_matching_root(c, clean_root):
+                for prov in KNOWN_PROVIDERS:
+                    for pat in prov.get("cname_regex", []):
+                        if re.search(pat, c, re.IGNORECASE):
+                            return False
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def is_ip_associated_with_cloud_saas(ip_str: str) -> bool:
+    """
+    Checks reverse DNS (PTR) of IP to ensure it's not a generic SaaS / cloud endpoint
+    belonging to an external cloud provider.
+    """
+    try:
+        host, _, _ = socket.gethostbyaddr(ip_str.strip())
+        h_clean = clean_domain(host)
+        for prov in KNOWN_PROVIDERS:
+            for pat in prov.get("cname_regex", []):
+                if re.search(pat, h_clean, re.IGNORECASE):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def find_candidate_origin_ips(domain: str, additional_subdomains: Optional[List[str]] = None) -> List[str]:
     """
     Harvests candidate origin IPs by querying common unproxied subdomains
-    and extracting unique non-CDN IP addresses.
+    (plus any discovered subdomains from Subfinder) and extracting unique,
+    in-scope non-CDN IP addresses.
     """
     clean_dom = domain.strip().lower()
     if clean_dom.startswith("http://") or clean_dom.startswith("https://"):
@@ -158,12 +203,30 @@ def find_candidate_origin_ips(domain: str) -> List[str]:
 
     candidate_ips: Set[str] = set()
 
-    for sub in COMMON_DIRECT_SUBDOMAINS:
+    sub_list = list(COMMON_DIRECT_SUBDOMAINS)
+    if additional_subdomains:
+        for s in additional_subdomains:
+            s_clean = clean_domain(s)
+            if s_clean and s_clean != clean_dom and s_clean.endswith(f".{clean_dom}"):
+                sub_prefix = s_clean[:-len(f".{clean_dom}")].strip(".")
+                if sub_prefix and sub_prefix not in sub_list:
+                    sub_list.append(sub_prefix)
+
+    for sub in sub_list:
         sub_fqdn = f"{sub}.{clean_dom}"
+        
+        # Scope Guard Pre-Filter: skip any third-party SaaS subdomains
+        if not is_candidate_subdomain_in_scope(sub_fqdn, clean_dom):
+            logger.debug("[Scope Guard] Skipping unproxied candidate %s: points to third-party SaaS.", sub_fqdn)
+            continue
+
         sub_ips = resolve_domain_ips(sub_fqdn)
         for ip in sub_ips:
             in_cdn, _ = is_ip_in_cdn(ip)
             if not in_cdn:
+                if is_ip_associated_with_cloud_saas(ip):
+                    logger.debug("[Scope Guard] Skipping IP %s: reverse DNS indicates third-party SaaS.", ip)
+                    continue
                 candidate_ips.add(ip)
 
     return sorted(list(candidate_ips))
@@ -209,7 +272,7 @@ def verify_origin_ip(candidate_ip: str, target_domain: str, baseline_title: Opti
     return False, "Candidate IP did not respond with matching host content."
 
 
-def run_origin_recon(domain: str) -> Dict[str, Any]:
+def run_origin_recon(domain: str, additional_subdomains: Optional[List[str]] = None) -> Dict[str, Any]:
     """
     Main orchestrator for Origin IP discovery and WAF bypass assessment.
     """
@@ -231,7 +294,7 @@ def run_origin_recon(domain: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    candidates = find_candidate_origin_ips(clean_dom)
+    candidates = find_candidate_origin_ips(clean_dom, additional_subdomains=additional_subdomains)
     verified_origins = []
 
     for ip in candidates:
@@ -262,4 +325,25 @@ def run_origin_recon(domain: str) -> Dict[str, Any]:
             if waf_bypassed else
             ("الهدف محمي بجدار حماية ولم يتم كشف سيرفر الأصل." if waf_info["is_behind_waf"] else "الهدف غير محمي بجدار حماية خارجي (مباشر).")
         )
+    }
+
+
+def load_waf_bypass_info(session_dir: str) -> Dict[str, Any]:
+    """Safely retrieves WAF bypass and Origin IP metadata from a session directory."""
+    import os
+    import json
+    waf_file = os.path.join(session_dir, "waf_bypass.json")
+    if os.path.exists(waf_file):
+        try:
+            with open(waf_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "status": "none",
+        "is_behind_waf": False,
+        "waf_provider": "None detected",
+        "waf_bypassed": False,
+        "origin_discovered": False,
+        "verified_origins": []
     }

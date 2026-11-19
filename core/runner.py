@@ -149,7 +149,8 @@ def run_docker_tool(
     timeout: int = 45,
     container_mount: str = "/data",
     extra_volumes: Optional[List[Tuple[str, str]]] = None,
-    scan_id: Optional[str] = None
+    scan_id: Optional[str] = None,
+    extra_hosts: Optional[Dict[str, str]] = None
 ) -> Tuple[bool, str]:
     """
     Executes a security tool inside a temporary Docker container mounting volume_dir to /data
@@ -195,6 +196,10 @@ def run_docker_tool(
     if extra_volumes:
         for host_p, cont_p in extra_volumes:
             cmd.extend(["-v", f"{get_docker_volume_path(host_p)}:{cont_p}"])
+    if extra_hosts:
+        for host_name, host_ip in extra_hosts.items():
+            if host_name and host_ip:
+                cmd.extend(["--add-host", f"{host_name}:{host_ip}"])
     cmd.append(image)
     cmd.extend(args)
     

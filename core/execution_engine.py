@@ -164,22 +164,34 @@ def run_stage1_pipeline(scan_id: str, domain: Optional[str] = None) -> Dict[str,
     if not target_domain:
         raise ValueError(f"Target domain for scan_id '{scan_id}' not found.")
 
+    clean_domain = target_domain.strip().lower()
+    if "://" in clean_domain:
+        clean_domain = clean_domain.split("://", 1)[1]
+    clean_domain = clean_domain.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+
+    # ── Stage 0: WAF Detection & Scope-Guarded Origin IP Discovery ──────────
+    waf_file = os.path.join(session_dir, "waf_bypass.json")
+    if not os.path.exists(waf_file):
+        try:
+            from core.origin_recon import run_origin_recon
+            waf_result = run_origin_recon(clean_domain)
+            with open(waf_file, "w", encoding="utf-8") as wf:
+                json.dump(waf_result, wf, ensure_ascii=False, indent=2)
+        except Exception as ex:
+            print(f"[!] Warning: Origin recon error in Stage 0: {ex}", flush=True)
+
     update_status(
         scan_id,
         status="running",
         stage="phase1_discovery",
         progress=10,
-        log_message=f"تشغيل المرحلة الأولى (Subfinder + Naabu) للنطاق: {target_domain}"
+        log_message=f"تشغيل المرحلة الأولى (Subfinder + Naabu) للنطاق: {clean_domain}"
     )
 
     # 1. Subfinder
-    ok_sub, subdomains = run_subfinder(target_domain, session_dir, scan_id)
+    ok_sub, subdomains = run_subfinder(clean_domain, session_dir, scan_id)
 
     # 2. Naabu
-    clean_domain = target_domain.strip().lower()
-    if "://" in clean_domain:
-        clean_domain = clean_domain.split("://", 1)[1]
-    clean_domain = clean_domain.split("/", 1)[0].split(":", 1)[0].rstrip(".")
     naabu_targets = [clean_domain] + [s for s in subdomains if s.lower() != clean_domain]
 
     ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id)

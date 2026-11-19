@@ -139,7 +139,8 @@ def classify_scope(
     asn_info: Optional[Dict[str, Any]] = None,
     cdn_name: Optional[str] = None,
     status_code: Optional[int] = None,
-    location: Optional[str] = None
+    location: Optional[str] = None,
+    origin_ip: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Intelligently classifies an asset into Self-Hosted vs Third-Party SaaS / CDN,
@@ -185,46 +186,53 @@ def classify_scope(
     hosting_type = "self_hosted"
     external_cname_target: Optional[str] = None
 
-    # Tier 1 & 2: CNAME Inspection
-    for c in cnames:
-        if not is_domain_matching_root(c, clean_root):
-            is_third_party = True
-            external_cname_target = c
-            hosting_type = "third_party_saas"
-            
-            # Check known signatures for a friendly brand name
-            matched_brand = None
-            for prov in KNOWN_PROVIDERS:
-                for pat in prov["cname_regex"]:
-                    if re.search(pat, c, re.IGNORECASE):
-                        matched_brand = prov["name"]
+    clean_h = clean_domain(host)
+    if origin_ip and clean_h == clean_domain(origin_ip):
+        # Confirmed backend Origin IP is inherently self-hosted and in-scope
+        is_third_party = False
+        provider_name = "Self-Hosted Backend (Origin Server)"
+        hosting_type = "self_hosted_origin"
+    else:
+        # Tier 1 & 2: CNAME Inspection
+        for c in cnames:
+            if not is_domain_matching_root(c, clean_root):
+                is_third_party = True
+                external_cname_target = c
+                hosting_type = "third_party_saas"
+                
+                # Check known signatures for a friendly brand name
+                matched_brand = None
+                for prov in KNOWN_PROVIDERS:
+                    for pat in prov["cname_regex"]:
+                        if re.search(pat, c, re.IGNORECASE):
+                            matched_brand = prov["name"]
+                            break
+                    if matched_brand:
                         break
+                
                 if matched_brand:
-                    break
-            
-            if matched_brand:
-                provider_name = matched_brand
-            else:
-                provider_name = f"External Third-Party ({c})"
-            break
+                    provider_name = matched_brand
+                else:
+                    provider_name = f"External Third-Party ({c})"
+                break
 
-    # If CNAME didn't flag, check CDN & ASN signals
-    if not is_third_party:
-        if cdn:
-            # CDN Detected (e.g. cloudflare, google, akamai, etc.)
-            is_third_party = True
-            hosting_type = "cloud_cdn"
-            provider_name = f"Cloud CDN ({cdn.title()})"
-        elif as_name:
-            for prov in KNOWN_PROVIDERS:
-                for asn_pat in prov["asn_regex"]:
-                    if re.search(asn_pat, as_name, re.IGNORECASE):
-                        # Cloud ASN without external CNAME (could be self-hosted on AWS/GCP EC2)
-                        hosting_type = "cloud_hosted"
-                        provider_name = f"{prov['name']} (Infrastructure)"
+        # If CNAME didn't flag, check CDN & ASN signals
+        if not is_third_party:
+            if cdn:
+                # CDN Detected (e.g. cloudflare, google, akamai, etc.)
+                is_third_party = True
+                hosting_type = "cloud_cdn"
+                provider_name = f"Cloud CDN ({cdn.title()})"
+            elif as_name:
+                for prov in KNOWN_PROVIDERS:
+                    for asn_pat in prov["asn_regex"]:
+                        if re.search(asn_pat, as_name, re.IGNORECASE):
+                            # Cloud ASN without external CNAME (could be self-hosted on AWS/GCP EC2)
+                            hosting_type = "cloud_hosted"
+                            provider_name = f"{prov['name']} (Infrastructure)"
+                            break
+                    if hosting_type != "self_hosted":
                         break
-                if hosting_type != "self_hosted":
-                    break
 
     # -------------------------------------------------------------------------
     # 3. Scope Tagging for DAST Guard & UI Badges

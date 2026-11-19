@@ -636,6 +636,16 @@ def get_scan_status(scan_id: Optional[str] = None, db: Session = Depends(get_db)
 
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
+
+    # Enrich status with real-time WAF bypass intelligence
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(get_session_dir(scan_id))
+        if waf_info and waf_info.get("status") != "none":
+            status["waf_bypass"] = waf_info
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "data": status
@@ -795,6 +805,9 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
                     "cvss_score": cvss_score,
                     "cvss_vector": cvss_vector,
                     "owasp_category": owasp_cat,
+                    "waf_bypassed": bool(raw.get("waf_bypassed", False)),
+                    "origin_ip": raw.get("origin_ip"),
+                    "bypassed_origin": bool(raw.get("bypassed_origin", False)),
                     "discovered_at": finding.discovered_at.isoformat() if finding.discovered_at else None,
                     "raw_output": raw
                 })
@@ -845,12 +858,21 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
     except Exception:
         pass
 
+    # Load WAF bypass information for session
+    waf_info = {}
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(get_session_dir(active_scan_id))
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "scan_id": active_scan_id,
         "total_vulnerabilities_found": len(results),
         "vulnerabilities": results,
         "data": results,
+        "waf_bypass": waf_info,
         "triage_suppressed_count": triage_suppressed_count,
         "triage_canonicalized_count": triage_canonicalized_count,
         "triage_summary": triage_summary,
@@ -1159,6 +1181,7 @@ def get_nuclei_info():
     """Returns Nuclei engine status and installed templates breakdown."""
     from core.runner import is_docker_available
     from core.stage3_vulnerabilities import get_nuclei_templates_info
+    from core.template_updater import count_templates
     
     templates = get_nuclei_templates_info()
     categories = {}
@@ -1170,7 +1193,7 @@ def get_nuclei_info():
         "status": "success",
         "engine": "Nuclei v3.11.1 (Docker & Native Engine)",
         "docker_available": is_docker_available(),
-        "total_templates": len(templates),
+        "total_templates": count_templates(),
         "categories": categories,
         "templates": templates
     }
@@ -2721,6 +2744,13 @@ def export_scan_json(
             pass
     target_domain = target_domain or ""
 
+    waf_info = {}
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(session_dir)
+    except Exception:
+        pass
+
     export_data = {
         "assessment_meta": {
             "platform": "YemenScan Cyber Security Platform",
@@ -2732,6 +2762,7 @@ def export_scan_json(
             "status": status.get("current_stage", ""),
             "is_completed": status.get("is_completed", False)
         },
+        "waf_bypass": waf_info,
         "stats": status.get("stats", {
             "subdomains_count": len(subdomains),
             "open_ports_count": len(ports),

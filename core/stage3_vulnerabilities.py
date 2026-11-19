@@ -1137,6 +1137,22 @@ def run_nuclei(
     with open(combined_raw_path, "w", encoding="utf-8") as crf:
         pass  # initialize empty file
 
+    # Check for confirmed Origin IP & WAF Bypass
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_extra_hosts: Optional[Dict[str, str]] = None
+    waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
+    origin_ip = None
+    if waf_bypassed:
+        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
+        root_dom = waf_info.get("domain") or ""
+        if root_dom and origin_ip:
+            origin_extra_hosts = {
+                root_dom: origin_ip,
+                f"www.{root_dom}": origin_ip
+            }
+            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Nuclei: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}) عبر حاوية الفحص.", flush=True)
+
     all_stderr = []
     start_time = time.time()
     circuit_breaker_triggered = False
@@ -1237,7 +1253,8 @@ def run_nuclei(
             volume_dir=session_dir,
             timeout=p_timeout,
             extra_volumes=extra_vols,
-            scan_id=scan_id
+            scan_id=scan_id,
+            extra_hosts=origin_extra_hosts
         )
 
         executed_any_profile = True
@@ -1319,6 +1336,12 @@ def run_nuclei(
     valid_origins = set(targets)
     parsed_findings, counts = parse_nuclei_json_output(combined_raw_path, valid_target_origins=valid_origins)
 
+    if waf_bypassed:
+        for f in parsed_findings:
+            f["waf_bypassed"] = True
+            f["origin_ip"] = origin_ip
+            f["bypassed_origin"] = True
+
     # Save parsed findings
     nuclei_output_file = os.path.join(session_dir, "nuclei_findings.json")
     with open(nuclei_output_file, "w", encoding="utf-8") as f:
@@ -1336,6 +1359,10 @@ def run_nuclei(
         "templates_checksum": NUCLEI_TEMPLATES_CHECKSUM,
         "input_count": len(targets),
         "profile_count": len(profiles),
+        "waf_bypassed": waf_bypassed,
+        "origin_ip": origin_ip,
+        "resolved_to_origin": bool(origin_extra_hosts),
+        "waf_provider": waf_info.get("waf_provider", "None detected"),
         "baseline_template_count": summary.get("baseline_template_count", 0),
         "technology_template_count": summary.get("technology_template_count", 0),
         "discovery_template_count": summary.get("discovery_template_count", 0),
@@ -1774,6 +1801,22 @@ def run_wapiti_dast(
     executed_any = False
     any_success = False
 
+    # Check for confirmed Origin IP & WAF Bypass
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_extra_hosts: Optional[Dict[str, str]] = None
+    waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
+    origin_ip = None
+    if waf_bypassed:
+        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
+        root_dom = waf_info.get("domain") or ""
+        if root_dom and origin_ip:
+            origin_extra_hosts = {
+                root_dom: origin_ip,
+                f"www.{root_dom}": origin_ip
+            }
+            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Wapiti DAST: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
+
     for idx, target_orig in enumerate(targets_to_audit, start=1):
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} cancelled.")
@@ -1821,7 +1864,8 @@ def run_wapiti_dast(
             args=args,
             volume_dir=session_dir,
             timeout=180,
-            scan_id=scan_id
+            scan_id=scan_id,
+            extra_hosts=origin_extra_hosts
         )
 
         executed_any = True
@@ -1873,6 +1917,12 @@ def run_wapiti_dast(
     except Exception:
         pass
 
+    if waf_bypassed:
+        for f in wapiti_findings:
+            f["waf_bypassed"] = True
+            f["origin_ip"] = origin_ip
+            f["bypassed_origin"] = True
+
     findings_file = os.path.join(session_dir, "wapiti_findings.json")
     with open(findings_file, "w", encoding="utf-8") as ff:
         json.dump(wapiti_findings, ff, ensure_ascii=False, indent=2)
@@ -1912,6 +1962,10 @@ def run_wapiti_dast(
         "modules_excluded_review": review_modules,
         "verify_ssl": 1 if verify_ssl else 0,
         "targets_scanned": targets_to_audit,
+        "waf_bypassed": waf_bypassed,
+        "origin_ip": origin_ip,
+        "resolved_to_origin": bool(origin_extra_hosts),
+        "waf_provider": waf_info.get("waf_provider", "None detected"),
         "max_active_security_scanners_per_origin": 1,
         "sequential_execution": True,
         "status": "completed" if status_completed else "failed",
@@ -2504,6 +2558,12 @@ def unify_and_save_vulnerabilities(
             t1 = set(primary.get("tags", []))
             t2 = set(secondary.get("tags", []))
             primary["tags"] = sorted(list(t1 | t2))
+            
+            # Merge WAF bypass / Origin attribution
+            primary["waf_bypassed"] = bool(primary.get("waf_bypassed") or secondary.get("waf_bypassed"))
+            primary["bypassed_origin"] = bool(primary.get("bypassed_origin") or secondary.get("bypassed_origin"))
+            if not primary.get("origin_ip") and secondary.get("origin_ip"):
+                primary["origin_ip"] = secondary.get("origin_ip")
             
             unified_map[group_key] = primary
 
