@@ -163,10 +163,14 @@ class StandaloneNucleiReq(BaseModel):
     target_url: str
     severity: Optional[str] = "medium,high,critical"
     category: Optional[str] = None
+    tags: Optional[str] = None
 
 class StandaloneWapitiReq(BaseModel):
     target_url: str
     modules: Optional[str] = None
+
+class OriginReconReq(BaseModel):
+    domain: str
 
 class NucleiScanRequest(BaseModel):
     target: str
@@ -1277,9 +1281,14 @@ def run_standalone_kiterunner_endpoint(req: StandaloneKiterunnerReq):
 @app.post("/api/tools/nuclei", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_nuclei_endpoint(req: StandaloneNucleiReq):
     """تشغيل Nuclei المستقل لفحص الثغرات وفق قوالب محددة ودرجات الخطورة."""
-    if not req.target_url or not req.target_url.strip().startswith("http"):
-        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    return run_standalone_nuclei(req.target_url, severity=req.severity)
+    if not req.target_url or len(req.target_url.strip()) < 3:
+        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب أو نطاق صالح للفحص.")
+    return run_standalone_nuclei(
+        target_url=req.target_url,
+        severity=req.severity,
+        category=req.category,
+        tags=req.tags
+    )
 
 
 @app.post("/api/tools/wapiti", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
@@ -1294,6 +1303,30 @@ def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
 def get_tools_status_endpoint():
     """التحقق من جاهزية وحالة الحاويات الست والأدوات في النظام."""
     return get_tools_readiness_status()
+
+
+@app.post("/api/tools/origin-ip", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
+def run_origin_recon_endpoint(req: OriginReconReq):
+    """كشف السيرفر الحقيقي (Origin IP) وتجاوز جدران الحماية (WAF Bypass)."""
+    from core.origin_recon import run_origin_recon
+    if not req.domain or len(req.domain.strip()) < 3:
+        raise HTTPException(status_code=400, detail="يرجى إدخال نطاق صالح لاستكشاف الأصل.")
+    return run_origin_recon(req.domain.strip())
+
+
+@app.get("/api/templates/status", tags=["4. إدارة وتحديث القوالب (Template Management)"])
+def get_templates_status_endpoint():
+    """عرض إحصائيات وحالة قوالب Nuclei المتاحة وتاريخ آخر تحديث."""
+    from core.template_updater import get_template_status
+    return get_template_status()
+
+
+@app.post("/api/templates/update", tags=["4. إدارة وتحديث القوالب (Template Management)"])
+def update_templates_endpoint(background_tasks: BackgroundTasks):
+    """إطلاق مهمة تحديث القوالب في الخلفية عبر سيليري مع بيئة التحقق والفرز."""
+    from core.tasks import dispatch_template_update
+    return dispatch_template_update(background_tasks=background_tasks)
+
 
 
 class SaveStandaloneReq(BaseModel):

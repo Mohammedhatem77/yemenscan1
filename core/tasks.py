@@ -75,6 +75,13 @@ def celery_run_tool(self, scan_id: str, tool_name: str, options: Dict[str, Any])
     return run_tool_in_session(scan_id, tool_name, options)
 
 
+@celery_app.task(bind=True, name="yemenscan.tasks.update_nuclei_templates")
+def celery_update_nuclei_templates(self):
+    """Executes asynchronous background template update & validation."""
+    from core.template_updater import run_template_update_job
+    return run_template_update_job()
+
+
 # ---------------------------------------------------------------------------
 # Smart Dispatcher (Celery with graceful BackgroundTasks fallback)
 # ---------------------------------------------------------------------------
@@ -177,3 +184,22 @@ def _execute_full_scan_fallback(domain: str, scan_id: str):
                 complete_scan_session(db, scan_id, status="failed")
         except Exception:
             pass
+
+
+def dispatch_template_update(background_tasks=None) -> Dict[str, str]:
+    """Dispatches template update to Celery or FastAPI BackgroundTasks."""
+    from core.template_updater import run_template_update_job
+    if is_celery_broker_reachable():
+        try:
+            celery_update_nuclei_templates.apply_async(ignore_result=True)
+            logger.info("[Celery Dispatcher] Template update dispatched to Celery worker.")
+            return {"mode": "celery", "status": "started", "message": "تم إرسال مهمة تحديث القوالب إلى عامل سيليري في الخلفية."}
+        except Exception as ex:
+            logger.warning("[Celery Dispatcher] Failed to dispatch to Celery (%s), falling back.", ex)
+    if background_tasks:
+        background_tasks.add_task(run_template_update_job)
+    else:
+        import threading
+        threading.Thread(target=run_template_update_job, daemon=True).start()
+    return {"mode": "background_tasks", "status": "started", "message": "تم بدء تحديث القوالب في الخلفية."}
+

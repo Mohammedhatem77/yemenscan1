@@ -13,6 +13,7 @@ from core.stage2_web_probing import run_httpx, run_kiterunner_or_api_probing
 from core.stage3_vulnerabilities import (
     prepare_nuclei_targets,
     run_nuclei,
+    run_standalone_nuclei as _run_standalone_nuclei_backend,
     run_wapiti_dast,
     unify_and_save_vulnerabilities,
     NUCLEI_DOCKER_IMAGE,
@@ -593,21 +594,22 @@ def run_standalone_kiterunner(target_url: str) -> Dict[str, Any]:
     }
 
 
-def run_standalone_nuclei(target_url: str, severity: Optional[str] = None) -> Dict[str, Any]:
-    """Runs Nuclei independently against a target URL."""
-    run_id = f"nuclei_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
-    os.makedirs(work_dir, exist_ok=True)
-
-    targets_file = os.path.join(work_dir, "active_urls.txt")
-    with open(targets_file, "w", encoding="utf-8") as f:
-        f.write(f"{target_url.strip()}\n")
-
-    prepare_nuclei_targets(work_dir)
-    ok, findings = run_nuclei(work_dir, run_id, severity=severity)
+def run_standalone_nuclei(
+    target_url: str,
+    severity: Optional[str] = None,
+    category: Optional[str] = None,
+    tags: Optional[str] = None
+) -> Dict[str, Any]:
+    """Runs Nuclei independently against a target URL or domain with full template library and controls."""
+    findings = _run_standalone_nuclei_backend(
+        target_url=target_url,
+        category=category,
+        severity=severity,
+        tags=tags
+    )
     return {
         "tool": "nuclei",
-        "status": "success" if ok else "failed",
+        "status": "success",
         "target_url": target_url.strip(),
         "total_findings": len(findings),
         "findings": findings

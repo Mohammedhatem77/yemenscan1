@@ -1339,16 +1339,30 @@
                             تشغيل واختبار أي أداة من الأدوات الست بشكل منفصل على هدف مخصص مع إمكانية التصدير والحفظ في قاعدة البيانات
                         </p>
                     </div>
-                    <div id="toolsReadinessBadge" style="font-size: 0.85rem; background: rgba(56, 189, 248, 0.15); padding: 6px 14px; border-radius: 8px; border: 1px solid #38bdf8; color: #38bdf8;">
-                        ⏳ جاري فحص جاهزية الأدوات...
+                    <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+                        <div id="templatesLifecycleBar" style="font-size: 0.82rem; background: rgba(30, 41, 59, 0.7); padding: 5px 12px; border-radius: 8px; border: 1px solid rgba(56, 189, 248, 0.3); color: #cbd5e1; display: flex; align-items: center; gap: 8px;">
+                            <span>📚 القوالب: <strong id="tplStatusCount" style="color:#38bdf8;">10,972</strong></span>
+                            <span style="color:#64748b;">|</span>
+                            <span>الإصدار: <span id="tplStatusVer" style="color:#a78bfa;">v10.5.1</span></span>
+                            <button type="button" id="btnUpdateTemplates" onclick="triggerTemplateUpdate()" class="btn btn-secondary" style="padding: 2px 8px; font-size: 0.75rem; margin-right: 4px; display: inline-flex; align-items: center; gap: 4px;">
+                                <span id="tplUpdateIcon">🔄</span> <span id="tplUpdateLabel">تحديث القوالب</span>
+                            </button>
+                        </div>
+                        <div id="toolsReadinessBadge" style="font-size: 0.85rem; background: rgba(56, 189, 248, 0.15); padding: 6px 14px; border-radius: 8px; border: 1px solid #38bdf8; color: #38bdf8;">
+                            ⏳ جاري فحص جاهزية الأدوات...
+                        </div>
                     </div>
                 </div>
 
-                <!-- Tool Selector Grid (6 Security Tools) -->
+                <!-- Tool Selector Grid (Security Tools) -->
                 <div class="tools-selector-grid">
                     <button type="button" class="tool-card-btn active" id="toolBtn_nuclei" onclick="selectStandaloneTool('nuclei')">
                         <div class="tool-card-title">🔬 Nuclei</div>
                         <div class="tool-card-subtitle">فحص الثغرات و CVEs</div>
+                    </button>
+                    <button type="button" class="tool-card-btn" id="toolBtn_origin" onclick="selectStandaloneTool('origin')">
+                        <div class="tool-card-title">🛡️ Origin Recon</div>
+                        <div class="tool-card-subtitle">كشف الأصل وتجاوز الـ WAF</div>
                     </button>
                     <button type="button" class="tool-card-btn" id="toolBtn_subfinder" onclick="selectStandaloneTool('subfinder')">
                         <div class="tool-card-title">🔍 Subfinder</div>
@@ -1388,15 +1402,18 @@
                         <div id="wrapperCategorySelect" style="display: block;">
                             <select id="standaloneCategorySelect" class="scan-input" style="min-width: 210px;">
                                 <option value="">جميع القوالب المتاحة (All Templates)</option>
-                                <option value="wordpress">أنظمة ووردبريس (WordPress)</option>
+                                <option value="cves">ثغرات الـ CVEs الرسمية (Official CVEs)</option>
+                                <option value="exposed-panels">لوحات التحكم المكشوفة (Exposed Panels)</option>
+                                <option value="misconfiguration">أخطاء الإعدادات والتكوين (Misconfigurations)</option>
+                                <option value="exposures">تسريبات التكوين والبيانات (.env / Git / Logs)</option>
+                                <option value="vulnerabilities">ثغرات الويب العامة (OWASP Top 10 / Injection)</option>
+                                <option value="technologies">استكشاف التقنيات وبصمات الخدمات (Technologies)</option>
+                                <option value="wordpress">أنظمة ووردبريس (WordPress CMS)</option>
                                 <option value="php">بيئات بي إتش بي ولارافيل (PHP / Laravel)</option>
-                                <option value="apache">خوادم أباتشي (Apache)</option>
+                                <option value="apache">خوادم أباتشي وتومكات (Apache / Tomcat)</option>
                                 <option value="nginx">خوادم إنجن إكس (Nginx)</option>
                                 <option value="iis">خوادم مايكروسوفت (IIS / ASP.NET)</option>
-                                <option value="vulnerabilities">ثغرات الحقن (SQLi / LFI / XSS)</option>
-                                <option value="api">واجهات البرمجة (OWASP API)</option>
-                                <option value="exposures">تسريبات التكوين (.env / Git)</option>
-                                <option value="misconfigurations">أخطاء الإعدادات التكوينية</option>
+                                <option value="api">واجهات البرمجة (OWASP API / Swagger / GraphQL)</option>
                             </select>
                         </div>
 
@@ -2068,6 +2085,14 @@
                 btnText: '⚡ تشغيل فحص Nuclei فوري',
                 endpoint: '/api/tools/nuclei'
             },
+            origin: {
+                name: 'Origin Recon',
+                icon: '🛡️',
+                desc: 'كشف السيرفر الحقيقي (Origin Server) وتجاوز جدران الحماية (Cloudflare, Akamai) واختبار هيدر Host المباشر.',
+                placeholder: 'أدخل اسم النطاق (مثال: example.com)',
+                btnText: '⚡ كشف السيرفر الحقيقي (WAF Bypass)',
+                endpoint: '/api/tools/origin-ip'
+            },
             subfinder: {
                 name: 'Subfinder',
                 icon: '🔍',
@@ -2175,6 +2200,40 @@
             }
         }
 
+        async function loadTemplateLifecycleStatus() {
+            try {
+                const res = await fetch(`${API_BASE}/api/templates/status`);
+                const data = await res.json();
+                const countEl = document.getElementById('tplStatusCount');
+                const verEl = document.getElementById('tplStatusVer');
+                if (countEl && data.total_templates) countEl.textContent = Number(data.total_templates).toLocaleString();
+                if (verEl && data.upstream_version) verEl.textContent = data.upstream_version;
+            } catch (e) {
+                console.error('Template status error:', e);
+            }
+        }
+
+        async function triggerTemplateUpdate() {
+            const btn = document.getElementById('btnUpdateTemplates');
+            const icon = document.getElementById('tplUpdateIcon');
+            const label = document.getElementById('tplUpdateLabel');
+            if (btn) btn.disabled = true;
+            if (icon) icon.textContent = '⏳';
+            if (label) label.textContent = 'جاري التحديث...';
+            try {
+                const res = await fetch(`${API_BASE}/api/templates/update`, { method: 'POST' });
+                const data = await res.json();
+                alert(data.message || 'تم إرسال أمر تحديث القوالب بنجاح في الخلفية.');
+                setTimeout(loadTemplateLifecycleStatus, 2500);
+            } catch (e) {
+                alert('خطأ أثناء إرسال أمر التحديث: ' + e.message);
+            } finally {
+                if (btn) btn.disabled = false;
+                if (icon) icon.textContent = '🔄';
+                if (label) label.textContent = 'تحديث القوالب';
+            }
+        }
+
         async function executeStandaloneScan() {
             const targetInput = document.getElementById('standaloneTargetInput');
             const target = targetInput ? targetInput.value.trim() : '';
@@ -2213,8 +2272,7 @@
                 }
                 payload = { target_url: url };
             } else if (currentStandaloneTool === 'nuclei') {
-                let url = target;
-                if (!url.startsWith('http')) url = 'http://' + url;
+                let url = target.trim();
                 const cat = document.getElementById('standaloneCategorySelect') ? document.getElementById('standaloneCategorySelect').value : null;
                 const sev = document.getElementById('standaloneSeveritySelect') ? document.getElementById('standaloneSeveritySelect').value : 'medium,high,critical';
                 payload = { target_url: url, category: cat || null, severity: sev || null };
@@ -2223,6 +2281,11 @@
                 if (!url.startsWith('http')) url = 'http://' + url;
                 const mods = document.getElementById('standaloneModulesSelect') ? document.getElementById('standaloneModulesSelect').value : null;
                 payload = { target_url: url, modules: mods || null };
+            } else if (currentStandaloneTool === 'origin') {
+                let cleanDom = target.trim();
+                if (cleanDom.includes('://')) cleanDom = cleanDom.split('://')[1];
+                cleanDom = cleanDom.split('/')[0].split(':')[0];
+                payload = { domain: cleanDom };
             }
 
             try {
@@ -2452,6 +2515,47 @@
                         </tr>
                     `;
                 }).join('');
+
+            } else if (tool === 'origin') {
+                const origins = data.verified_origins || [];
+                const candidates = data.candidates || [];
+                const isWaf = data.is_behind_waf;
+                const wafBypassed = data.waf_bypassed;
+                if (countBadge) countBadge.textContent = `${origins.length} أصل مؤكد`;
+                header.innerHTML = `
+                    <th style="width: 140px;">حالة الجدار (WAF)</th>
+                    <th style="width: 160px;">السيرفر الحقيقي (Origin IP)</th>
+                    <th style="width: 110px; text-align: center;">مستوى الثقة</th>
+                    <th>الإثبات والتحقق (Proof of Bypass)</th>
+                    <th>عناوين الـ IP المرشحة</th>
+                `;
+                const wafBadge = isWaf 
+                    ? `<span class="badge ${wafBypassed ? 'badge-critical' : 'badge-high'}">جدار حماية (${data.waf_provider})</span>`
+                    : `<span class="badge badge-info">اتصال مباشر (بدون WAF)</span>`;
+                
+                if (!origins.length && !candidates.length) {
+                    body.innerHTML = `<tr><td colspan="5" class="empty-state">لم يتم كشف أي عناوين خوادم أصلية للنطاق ${data.domain}.</td></tr>`;
+                    return;
+                }
+                
+                const rowsHtml = origins.map(o => `
+                    <tr>
+                        <td>${wafBadge}</td>
+                        <td><strong style="color: #ef4444; font-family: monospace; font-size: 0.95rem;">🔓 ${o.origin_ip}</strong></td>
+                        <td style="text-align: center;"><span class="badge badge-critical">${o.confidence || 'HIGH'}</span></td>
+                        <td><div style="color: #38bdf8; font-size: 0.85rem;">${o.evidence}</div></td>
+                        <td><code style="color: #94a3b8;">${candidates.join(', ') || '-'}</code></td>
+                    </tr>
+                `).join('');
+                
+                body.innerHTML = rowsHtml || `
+                    <tr>
+                        <td>${wafBadge}</td>
+                        <td colspan="4" style="color: #f59e0b; padding: 1.2rem;">
+                            ⚠️ تم العثور على <strong>${candidates.length}</strong> عنوان IP مرشح (${candidates.join(', ')}) غير تابع لجدار الحماية، ولكن لم يتم تأكيد تطابق الـ Host header بشكل مباشر.
+                        </td>
+                    </tr>
+                `;
             }
         }
 
@@ -3045,6 +3149,7 @@
             loadScansHistory();
             loadNucleiInfo();
             checkToolsHealth();
+            loadTemplateLifecycleStatus();
             selectStandaloneTool('nuclei');
         };
     </script>
