@@ -126,6 +126,15 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         with open(ports_file, "r", encoding="utf-8", errors="replace") as pf:
             raw_ports = [line.strip() for line in pf if line.strip()]
 
+    # Load Stage 0 WAF bypass / Origin metadata if present
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_ip = None
+    target_root_domain = None
+    if waf_info.get("waf_bypassed") and waf_info.get("verified_origins"):
+        origin_ip = waf_info["verified_origins"][0].get("origin_ip")
+        target_root_domain = waf_info.get("domain")
+
     seen_inputs: Set[str] = set()
     valid_inputs: List[str] = []
     valid_input_endpoints: Set[Tuple[str, int]] = set()
@@ -198,6 +207,12 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "-o", "/data/httpx_raw.jsonl"
     ]
 
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir)
+    httpx_evasion_args = WAFEvasionEngine.build_httpx_args(evasion_cfg)
+    if httpx_evasion_args:
+        args.extend(httpx_evasion_args)
+
     ok, output = run_docker_tool(
         image="projectdiscovery/httpx:v1.12.0",
         args=args,
@@ -251,6 +266,51 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
     elif os.path.getsize(httpx_raw_file) == 0 and output and output.strip():
         with open(httpx_raw_file, "w", encoding="utf-8") as f:
             f.write(output.strip() + "\n")
+
+    # Adaptive Origin Probing: probe Origin IP with Host-header for virtual host matching
+    origin_endpoints = [inp for inp in valid_inputs if origin_ip and (inp.startswith(f"{origin_ip}:") or inp == origin_ip)]
+    if origin_endpoints and target_root_domain:
+        orig_inp_file = os.path.join(session_dir, "httpx_origin_input.txt")
+        orig_raw_file = os.path.join(session_dir, "httpx_origin_raw.jsonl")
+        try:
+            with open(orig_inp_file, "w", encoding="utf-8", newline="\n") as oif:
+                for o_inp in origin_endpoints:
+                    oif.write(f"{o_inp}\n")
+            
+            orig_args = [
+                "-l", "/data/httpx_origin_input.txt",
+                "-header", f"Host: {target_root_domain}",
+                "-silent",
+                "-title",
+                "-tech-detect",
+                "-status-code",
+                "-content-length",
+                "-web-server",
+                "-location",
+                "-asn",
+                "-duc",
+                "-timeout", "5",
+                "-retries", "1",
+                "-nf",
+                "-json",
+                "-o", "/data/httpx_origin_raw.jsonl"
+            ]
+            run_docker_tool(
+                image="projectdiscovery/httpx:v1.12.0",
+                args=orig_args,
+                volume_dir=session_dir,
+                timeout=max(60, len(origin_endpoints) * 5),
+                scan_id=scan_id
+            )
+            if os.path.exists(orig_raw_file):
+                with open(orig_raw_file, "r", encoding="utf-8", errors="replace") as orf:
+                    for line in orf:
+                        l = line.strip()
+                        if l and os.path.exists(httpx_raw_file):
+                            with open(httpx_raw_file, "a", encoding="utf-8") as hrf:
+                                hrf.write(f"{l}\n")
+        except Exception as e:
+            print(f"[!] Warning: HTTPX Origin Host-header probe error: {e}", flush=True)
 
     # Read and parse raw JSONL output line by line
     raw_lines: List[str] = []
@@ -379,8 +439,11 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             asn_info=asn_dict,
             cdn_name=cdn_name_val,
             status_code=status_code,
-            location=location_val
+            location=location_val,
+            origin_ip=origin_ip
         )
+
+        is_orig_target = bool(origin_ip and (host == origin_ip or str(data.get("input", "")).startswith(f"{origin_ip}:")))
 
         web_targets.append({
             "url": norm_url,
@@ -398,6 +461,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             "asn": asn_dict,
             "cdn": cdn_val,
             "cdn_name": cdn_name_val,
+            "is_origin": is_orig_target,
+            "origin_ip": origin_ip if is_orig_target else None,
             "is_third_party": scope_info["is_third_party"],
             "provider": scope_info["provider"],
             "hosting_type": scope_info["hosting_type"],
@@ -438,6 +503,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "unique_host_count": len(unique_hosts),
         "scheme_counts": scheme_counts,
         "status_code_counts": status_code_counts,
+        "origin_ip": origin_ip,
+        "origin_live_services": [wt["url"] for wt in web_targets if wt.get("is_origin")],
         "engine": "httpx",
         "version": "v1.12.0"
     }
@@ -867,12 +934,27 @@ def run_kiterunner_or_api_probing(
     # Calculate realistic timeout based on target count (min 300s, max 1200s)
     exec_timeout = max(300, min(1200, len(targets_for_scan) * 60))
 
+    # Check for confirmed Origin IP & WAF Bypass
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_extra_hosts: Optional[Dict[str, str]] = None
+    if waf_info.get("waf_bypassed") and waf_info.get("verified_origins"):
+        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
+        root_dom = waf_info.get("domain") or ""
+        if root_dom and origin_ip:
+            origin_extra_hosts = {
+                root_dom: origin_ip,
+                f"www.{root_dom}": origin_ip
+            }
+            print(f"[*] تفعيل تجاوز WAF في Kiterunner: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
+
     success, output = run_docker_tool(
         image=KITERUNNER_DOCKER_IMAGE,
         args=args,
         volume_dir=session_dir,
         timeout=exec_timeout,
-        scan_id=scan_id
+        scan_id=scan_id,
+        extra_hosts=origin_extra_hosts
     )
 
     if is_scan_cancelled(scan_id):
@@ -1139,6 +1221,9 @@ def run_kiterunner_or_api_probing(
         "methods": methods_count,
         "status_code_counts": status_code_counts,
         "engine": "kiterunner",
+        "waf_bypassed": bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins")),
+        "origin_ip": origin_ip if waf_info.get("waf_bypassed") and waf_info.get("verified_origins") else None,
+        "resolved_to_origin": bool(origin_extra_hosts),
         "upstream_version": KITERUNNER_UPSTREAM_VERSION,
         "upstream_commit": KITERUNNER_UPSTREAM_COMMIT,
         "build_variant": KITERUNNER_BUILD_VARIANT,

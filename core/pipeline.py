@@ -58,6 +58,26 @@ def package_session_evidence_and_metadata(
             "tool_statuses": tool_statuses,
             "tools": tool_metas
         }
+        waf_file = os.path.join(session_dir, "waf_bypass.json")
+        if os.path.exists(waf_file):
+            try:
+                with open(waf_file, "r", encoding="utf-8") as wf:
+                    unified_meta["waf_bypass"] = json.load(wf)
+            except Exception:
+                pass
+
+        try:
+            from core.waf_evasion import WAFEvasionEngine
+            ev_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir)
+            unified_meta["waf_evasion"] = {
+                "evasion_active": ev_cfg.evasion_active,
+                "is_behind_waf": ev_cfg.is_behind_waf,
+                "spoofed_headers_count": len(ev_cfg.spoofed_headers) if ev_cfg.evasion_active else 0,
+                "user_agent_masked": ev_cfg.evasion_active,
+                "nuclei_delay": ev_cfg.nuclei_delay if ev_cfg.evasion_active else None
+            }
+        except Exception:
+            pass
         meta_path = os.path.join(session_dir, "scan_metadata.json")
         with open(meta_path, "w", encoding="utf-8") as out_m:
             json.dump(unified_meta, out_m, ensure_ascii=False, indent=2)
@@ -98,14 +118,23 @@ def package_session_evidence_and_metadata(
     except Exception as e:
         print(f"[-] ملاحظة: تعذر أرشفة الأدلة الخام والميتاداتا: {e}", flush=True)
 
-def run_full_pipeline(domain: str, scan_id: str) -> None:
+def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> None:
     """
     Executes the end-to-end 3-phase Black-box attack surface management pipeline:
     1. Phase 1: Subfinder (Subdomains) -> Naabu (Ports)
     2. Phase 2: HTTPX (Live Web Servers) -> Kiterunner (API & Route Discovery)
     3. Phase 3: Nuclei (CVEs & OWASP API Top 10) + Wapiti (DAST Web Top 10) -> Unified Report
     Supports real-time cancellation, preserves stage assets, and honors tool outcomes.
+
+    Args:
+        domain: Target domain to scan.
+        scan_id: Session ID.
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Controls tool timeouts,
+                      rate limits, concurrency, and DAST module injection depth.
     """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    if scan_profile not in _VALID_PROFILES:
+        scan_profile = "safe"
     session_dir = get_session_dir(scan_id)
     tool_statuses: Dict[str, str] = {}
     phase_completed = {"phase1": False, "phase2": False, "phase3": False}
@@ -123,12 +152,57 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
             log_message=f"بدء تنفيذ خط الفحص الشامل للنطاق المستهدف: {domain}"
         )
         
+        clean_domain = domain.strip().lower()
+        if "://" in clean_domain:
+            clean_domain = clean_domain.split("://", 1)[1]
+        clean_domain = clean_domain.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+
+        # -------------------------------------------------------------
+        # Phase 0: WAF Detection & Scope-Guarded Origin IP Discovery Gateway
+        # -------------------------------------------------------------
+        if is_scan_cancelled(scan_id):
+            raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
+
+        update_status(
+            scan_id,
+            status="running",
+            stage="stage0_origin_gateway",
+            progress=6,
+            log_message=f"المرحلة 0: فحص جدار الحماية (WAF) وكشف السيرفر الحقيقي للنطاق: {clean_domain}"
+        )
+
+        try:
+            from core.origin_recon import run_origin_recon
+            waf_result = run_origin_recon(clean_domain)
+            waf_file = os.path.join(session_dir, "waf_bypass.json")
+            with open(waf_file, "w", encoding="utf-8") as wf:
+                json.dump(waf_result, wf, ensure_ascii=False, indent=2)
+
+            if waf_result.get("waf_bypassed"):
+                orig_ip = waf_result["verified_origins"][0]["origin_ip"]
+                prov = waf_result.get("waf_provider", "WAF")
+                print(f"[+] [WAF Bypass] ✅ تم كشف السيرفر الحقيقي بنجاح: {orig_ip} خلف جدار {prov}", flush=True)
+            elif waf_result.get("is_behind_waf"):
+                print(f"[*] [WAF Detected] النطاق محمي بجدار حماية ({waf_result.get('waf_provider')})، جاري استكمال الفحص الشامل.", flush=True)
+            else:
+                print(f"[*] [WAF Check] النطاق مباشر ولا يظهر جدار حماية سحابي وسيط.", flush=True)
+        except Exception as ex:
+            print(f"[!] Warning: Origin recon error in Stage 0: {ex}", flush=True)
+
         # -------------------------------------------------------------
         # Phase 1: Discovery & Port Scanning
         # -------------------------------------------------------------
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-        ok_sub, subdomains = run_subfinder(domain, session_dir, scan_id)
+
+        update_status(
+            scan_id,
+            status="running",
+            stage="phase1_discovery",
+            progress=10,
+            log_message=f"المرحلة الأولى: تشغيل Subfinder و Naabu للنطاق: {clean_domain}"
+        )
+        ok_sub, subdomains = run_subfinder(clean_domain, session_dir, scan_id)
         if ok_sub:
             tool_statuses["subfinder"] = "success" if subdomains else "empty"
         else:
@@ -237,7 +311,10 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
         if in_scope_urls and all_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+            try:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id, scan_profile=scan_profile)
+            except TypeError:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
             if ok_nuc:
                 tool_statuses["nuclei"] = "success" if nuclei_findings else "empty"
             else:
@@ -262,7 +339,10 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
         if dast_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
+            try:
+                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets, profile=scan_profile)
+            except TypeError:
+                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
             if ok_wap:
                 tool_statuses["wapiti"] = "success" if wapiti_findings else "empty"
             else:

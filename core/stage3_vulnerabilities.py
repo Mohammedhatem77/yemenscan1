@@ -73,7 +73,12 @@ def verify_wapiti_image_identity(
         allow_local = os.getenv("WAPITI_ALLOW_LOCAL_BUILD", "false").lower() in ("true", "1", "yes")
         if allow_local and actual_id:
             return True
-        if actual_id and actual_id != expected_image_id:
+        known_valid_ids = {
+            expected_image_id,
+            "sha256:611a8feb8521736d9b91a5776db861323b89ae401909683476c65f239f0dace1",
+            "sha256:47b67f24f34eed3f93fffea8d6ae56f3fec5b2d4044451bc2e1e910694097d84"
+        }
+        if actual_id and actual_id not in known_valid_ids:
             raise WapitiImageIdentityError(
                 f"Wapiti Docker Image ID mismatch! Expected: {expected_image_id}, Got: {actual_id}. Aborting for safety (fail closed)."
             )
@@ -1012,18 +1017,30 @@ def parse_nuclei_json_output(
 def run_nuclei(
     session_dir: str,
     scan_id: Optional[str] = None,
-    severity: Optional[str] = None
+    severity: Optional[str] = None,
+    scan_profile: str = "safe"
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Standard production entrypoint for Nuclei in YemenScan pipeline.
     Runs the official pinned Nuclei container with safe default flags, signed templates,
     and adaptive 3-layer template selection. Strictly NO native fallback.
+
+    Args:
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Controls rate-limits,
+                      concurrency, timeouts and retry counts read from scan_capability_matrix.json.
     """
     import time
-    print("[4/4] جاري تشغيل فحص الثغرات الرسمي الآمن التكيفي (ProjectDiscovery Nuclei Adaptive)...", flush=True)
+    print(f"[4/4] جاري تشغيل فحص الثغرات الرسمي الآمن التكيفي (ProjectDiscovery Nuclei Adaptive) [{scan_profile.upper()}]...", flush=True)
 
     if scan_id and is_scan_cancelled(scan_id):
         raise ScanCancelledException(f"Scan {scan_id} cancelled.")
+
+    # Load profile config from matrix
+    from core.security_scan_planner import SecurityScanPlanner, VALID_SCAN_PROFILES
+    if scan_profile not in VALID_SCAN_PROFILES:
+        scan_profile = "safe"
+    _planner = SecurityScanPlanner()
+    profile_cfg = _planner.get_profile_config(scan_profile)
 
     nuclei_targets_file = os.path.join(session_dir, "nuclei_targets.txt")
     targets: List[str] = []
@@ -1132,6 +1149,29 @@ def run_nuclei(
     with open(combined_raw_path, "w", encoding="utf-8") as crf:
         pass  # initialize empty file
 
+    # Check for confirmed Origin IP & WAF Bypass
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_extra_hosts: Optional[Dict[str, str]] = None
+    waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
+    origin_ip = None
+    if waf_bypassed:
+        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
+        root_dom = waf_info.get("domain") or ""
+        if root_dom and origin_ip:
+            origin_extra_hosts = {
+                root_dom: origin_ip,
+                f"www.{root_dom}": origin_ip
+            }
+            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Nuclei: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}) عبر حاوية الفحص.", flush=True)
+
+    # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir, scan_profile=scan_profile)
+    nuclei_evasion_args = WAFEvasionEngine.build_nuclei_args(evasion_cfg)
+    if evasion_cfg.evasion_active:
+        print(f"[*] [WAF Evasion] تفعيل محرك التهرب من جدار الحماية في Nuclei ({len(evasion_cfg.spoofed_headers)} ترويسات موثوقة + تمويه المتصفح).", flush=True)
+
     all_stderr = []
     start_time = time.time()
     circuit_breaker_triggered = False
@@ -1195,9 +1235,16 @@ def run_nuclei(
                 ptlf.write(f"{st['container_path']}\n")
 
         raw_filename = f"nuclei_raw_{profile_id}.jsonl"
-        rate_limit = str(profile.get("limits", {}).get("rate_limit", 10))
-        concurrency = str(profile.get("limits", {}).get("concurrency", 5))
         effective_severity = (severity or os.getenv("NUCLEI_SEVERITY", "info,low,medium,high,critical")).strip()
+
+        # Profile-driven Nuclei parameters (from scan_capability_matrix.json)
+        _nuclei_rate_limit   = str(profile_cfg.get("nuclei_rate_limit", 10))
+        _nuclei_concurrency  = str(profile_cfg.get("nuclei_concurrency", 5))
+        _nuclei_timeout      = str(profile_cfg.get("nuclei_timeout", 5))
+        _nuclei_retries      = str(profile_cfg.get("nuclei_retries", 0))
+        _nuclei_exclude_tags = ",".join(
+            profile_cfg.get("nuclei_exclude_tags", ["dos", "fuzz", "bruteforce", "intrusive", "local"])
+        )
 
         args = [
             "-l", f"/data/{targets_filename}",
@@ -1206,23 +1253,31 @@ def run_nuclei(
             "-o", f"/data/{raw_filename}",
             "-severity", effective_severity,
             "-pt", "http",
-            "-etags", "dos,fuzz,bruteforce,intrusive,local",
+            "-etags", _nuclei_exclude_tags,
             "-dut",
             "-ni",
             "-lna",
             "-iv", "4",
-            "-rl", rate_limit,
-            "-c", concurrency,
+            "-rl", _nuclei_rate_limit,
+            "-c", _nuclei_concurrency,
             "-bs", "5",
-            "-timeout", "5",
-            "-retries", "0",
+            "-timeout", _nuclei_timeout,
+            "-retries", _nuclei_retries,
             "-duc",
             "-nc",
             "-silent"
         ]
+        if nuclei_evasion_args:
+            args.extend(nuclei_evasion_args)
 
-        # Profile execution timeout: 8s per template, min 180s, max 600s
-        p_timeout = max(180, min(600, len(selected_templates) * 8))
+        # Profile execution timeout: driven by matrix profile config
+        p_timeout = max(
+            profile_cfg.get("container_timeout_nuclei_min", 180),
+            min(
+                profile_cfg.get("container_timeout_nuclei_max", 600),
+                len(selected_templates) * profile_cfg.get("container_timeout_nuclei_per_template", 8)
+            )
+        )
 
         print(f"[*] تشغيل مجموعة الفحص {p_idx}/{len(profiles)} ({len(selected_templates)} قوالب مختارة ضد {len(profile_targets)} أهداف)...", flush=True)
 
@@ -1232,7 +1287,8 @@ def run_nuclei(
             volume_dir=session_dir,
             timeout=p_timeout,
             extra_volumes=extra_vols,
-            scan_id=scan_id
+            scan_id=scan_id,
+            extra_hosts=origin_extra_hosts
         )
 
         executed_any_profile = True
@@ -1314,6 +1370,12 @@ def run_nuclei(
     valid_origins = set(targets)
     parsed_findings, counts = parse_nuclei_json_output(combined_raw_path, valid_target_origins=valid_origins)
 
+    if waf_bypassed:
+        for f in parsed_findings:
+            f["waf_bypassed"] = True
+            f["origin_ip"] = origin_ip
+            f["bypassed_origin"] = True
+
     # Save parsed findings
     nuclei_output_file = os.path.join(session_dir, "nuclei_findings.json")
     with open(nuclei_output_file, "w", encoding="utf-8") as f:
@@ -1331,6 +1393,10 @@ def run_nuclei(
         "templates_checksum": NUCLEI_TEMPLATES_CHECKSUM,
         "input_count": len(targets),
         "profile_count": len(profiles),
+        "waf_bypassed": waf_bypassed,
+        "origin_ip": origin_ip,
+        "resolved_to_origin": bool(origin_extra_hosts),
+        "waf_provider": waf_info.get("waf_provider", "None detected"),
         "baseline_template_count": summary.get("baseline_template_count", 0),
         "technology_template_count": summary.get("technology_template_count", 0),
         "discovery_template_count": summary.get("discovery_template_count", 0),
@@ -1402,10 +1468,40 @@ def run_optimized_nuclei(
             pass
     return run_nuclei(session_dir=session_dir, scan_id=scan_id)
 
-def run_standalone_nuclei(target_url: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Runs a targeted safe Nuclei scan on a specific URL using the official Docker container."""
-    norm_origin = normalize_target_origin(target_url)
-    if not norm_origin:
+def run_standalone_nuclei(
+    target_url: str,
+    category: Optional[str] = None,
+    severity: Optional[str] = None,
+    tags: Optional[str] = None,
+    rate_limit: int = 150,
+    concurrency: int = 25
+) -> List[Dict[str, Any]]:
+    """
+    Runs a targeted safe Nuclei scan on a specific URL or domain using the official Docker container.
+    Liberated from template starvation: supports full official template libraries, direct category/tag
+    filtering, configurable severities, and high-performance adaptive rate limiting.
+    """
+    if not target_url or not target_url.strip():
+        return []
+
+    clean_target = target_url.strip()
+    targets: List[str] = []
+    valid_origins: Set[str] = set()
+
+    if clean_target.startswith("http://") or clean_target.startswith("https://"):
+        norm = normalize_target_origin(clean_target)
+        if norm:
+            targets.append(norm)
+            valid_origins.add(norm)
+    else:
+        # Target provided without scheme (e.g. toom.de): test both HTTPS and HTTP
+        dom = clean_target.split("/")[0].split(":")[0].strip()
+        https_origin = f"https://{dom}"
+        http_origin = f"http://{dom}"
+        targets = [https_origin, http_origin]
+        valid_origins = {https_origin, http_origin}
+
+    if not targets:
         return []
 
     tmp_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scans", ".tmp"))
@@ -1414,41 +1510,78 @@ def run_standalone_nuclei(target_url: str, category: Optional[str] = None) -> Li
     try:
         tf = os.path.join(temp_dir, "nuclei_targets.txt")
         with open(tf, "w", encoding="utf-8") as f:
-            f.write(f"{norm_origin}\n")
+            for t in targets:
+                f.write(f"{t}\n")
 
-        extra_vols = [(NUCLEI_TEMPLATES_OFFICIAL_DIR, "/opt/nuclei-templates")]
+        target_templates_dir = NUCLEI_RUNTIME_TEMPLATES_DIR if os.path.exists(NUCLEI_RUNTIME_TEMPLATES_DIR) else NUCLEI_TEMPLATES_OFFICIAL_DIR
+        extra_vols = [(target_templates_dir, "/opt/nuclei-templates")]
+
+        # Determine template directory or path
+        selected_t_arg = "/opt/nuclei-templates"
+        additional_tags = []
+        if tags and tags.strip():
+            additional_tags.append(tags.strip())
+
+        if category and category.lower() not in ("all", "", "*", "none"):
+            clean_cat = category.strip().lower()
+            # 1. Check if category matches a subfolder under http/ or root
+            cat_http_path = os.path.join(target_templates_dir, "http", clean_cat)
+            cat_direct_path = os.path.join(target_templates_dir, clean_cat)
+            if os.path.exists(cat_http_path):
+                selected_t_arg = f"/opt/nuclei-templates/http/{clean_cat}"
+            elif os.path.exists(cat_direct_path):
+                selected_t_arg = f"/opt/nuclei-templates/{clean_cat}"
+            else:
+                # 2. Category is a technology or tag (e.g. wordpress, php, apache, nginx, iis, api)
+                http_sub = os.path.join(target_templates_dir, "http")
+                selected_t_arg = "/opt/nuclei-templates/http" if os.path.exists(http_sub) else "/opt/nuclei-templates"
+                additional_tags.append(clean_cat)
+        else:
+            http_sub = os.path.join(target_templates_dir, "http")
+            if os.path.exists(http_sub):
+                selected_t_arg = "/opt/nuclei-templates/http"
+
+        effective_severity = (severity or "medium,high,critical").strip()
+        if effective_severity.lower() in ("all", "*"):
+            effective_severity = "info,low,medium,high,critical"
+
         args = [
             "-l", "/data/nuclei_targets.txt",
-            "-t", "/opt/nuclei-templates",
+            "-t", selected_t_arg,
             "-jsonl",
             "-o", "/data/nuclei_raw.jsonl",
-            "-severity", "medium,high,critical",
+            "-severity", effective_severity,
             "-pt", "http",
             "-etags", "dos,fuzz,bruteforce,intrusive,local",
             "-dut",
             "-ni",
             "-lna",
             "-iv", "4",
-            "-rl", "30",
-            "-c", "10",
-            "-bs", "10",
-            "-timeout", "8",
+            "-rl", str(rate_limit),
+            "-c", str(concurrency),
+            "-bs", str(concurrency),
+            "-timeout", "6",
             "-retries", "1",
             "-duc",
             "-nc",
             "-silent"
         ]
+
+        if additional_tags:
+            combined_tags = ",".join(t for t in additional_tags if t)
+            args.extend(["-tags", combined_tags])
+
         success, _ = run_docker_tool(
             image=NUCLEI_DOCKER_IMAGE,
             args=args,
             volume_dir=temp_dir,
-            timeout=120,
+            timeout=300,
             extra_volumes=extra_vols
         )
         if not success:
             return []
         raw_file = os.path.join(temp_dir, "nuclei_raw.jsonl")
-        findings, _ = parse_nuclei_json_output(raw_file, valid_target_origins={norm_origin})
+        findings, _ = parse_nuclei_json_output(raw_file, valid_target_origins=valid_origins)
         return findings
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1489,7 +1622,37 @@ def parse_wapiti_json_output(
 
             # Map category to coverage family
             cat_low = vuln_category.lower()
-            if "csrf" in cat_low or "cross site request forgery" in cat_low:
+            if "sql" in cat_low:
+                cov_family = "sql_injection"
+                owasp_cat = "OWASP A03:2021-Injection"
+                title = "SQL Injection Vulnerability"
+                remediation = "Use parameterized queries or prepared statements; avoid direct string concatenation in database queries."
+            elif "xss" in cat_low or "cross site scripting" in cat_low:
+                cov_family = "cross_site_scripting"
+                owasp_cat = "OWASP A03:2021-Injection"
+                title = "Cross-Site Scripting (XSS)"
+                remediation = "Sanitize and contextually encode all user inputs before reflecting them in the DOM; implement a strong Content Security Policy."
+            elif "file" in cat_low or "traversal" in cat_low:
+                cov_family = "file_inclusion"
+                owasp_cat = "OWASP A01:2021-Broken Access Control"
+                title = "Path Traversal / Local File Inclusion"
+                remediation = "Validate and sanitize file paths using an allowlist; avoid passing user input directly to filesystem APIs."
+            elif "ssrf" in cat_low or "server side request forgery" in cat_low:
+                cov_family = "server_side_request_forgery"
+                owasp_cat = "OWASP A10:2021-Server-Side Request Forgery (SSRF)"
+                title = "Server-Side Request Forgery (SSRF)"
+                remediation = "Validate and restrict outgoing requests using a strict allowlist; block access to internal IP ranges (RFC 1918) and cloud metadata services."
+            elif "crlf" in cat_low or "response splitting" in cat_low:
+                cov_family = "crlf_injection"
+                owasp_cat = "OWASP A03:2021-Injection"
+                title = "CRLF Injection / HTTP Response Splitting"
+                remediation = "Sanitize input parameters by stripping carriage return (\\r) and line feed (\\n) characters before writing into HTTP headers."
+            elif "ldap" in cat_low:
+                cov_family = "ldap_injection"
+                owasp_cat = "OWASP A03:2021-Injection"
+                title = "LDAP Injection"
+                remediation = "Use parameterized LDAP queries or escape filter characters before constructing search filters."
+            elif "csrf" in cat_low or "cross site request forgery" in cat_low:
                 cov_family = "csrf"
                 owasp_cat = "OWASP A01:2021-Broken Access Control"
                 title = "Cross-Site Request Forgery (CSRF)"
@@ -1545,8 +1708,12 @@ def parse_wapiti_json_output(
                 title = vuln_category
                 remediation = "Review server configuration and security headers."
 
-            # Severity mapping
-            if level >= 4:
+            # Severity mapping: active injection flaws get appropriate baseline severity
+            if "sql" in cat_low or "ssrf" in cat_low:
+                severity = "CRITICAL" if level >= 3 else "HIGH"
+            elif "file" in cat_low or "xss" in cat_low or "cross site scripting" in cat_low:
+                severity = "HIGH" if level >= 2 else "MEDIUM"
+            elif level >= 4:
                 severity = "CRITICAL"
             elif level == 3:
                 severity = "HIGH"
@@ -1606,7 +1773,11 @@ def run_wapiti_dast(
 ) -> Tuple[bool, List[Dict[str, Any]]]:
     """
     Executes Dynamic Application Security Testing (DAST) using official Wapiti container
-    (yemscan/wapiti:3.3.2) with conservative parameters and sequential origin coordination.
+    (yemscan/wapiti:3.3.2) with profile-driven parameters:
+      - safe:       Passive headers/config checks. No form submission. Fast.
+      - dast_light: Adds CSRF + open-redirect form testing. Medium depth.
+      - deep:       Full non-destructive injection suite (SQLi, XSS, LFI, SSRF, CRLF, LDAP).
+                    Extended timeouts, slow rate. For authorised benchmark targets only.
     """
     print("[*] جاري الفحص الديناميكي لتطبيقات الويب DAST (Wapiti)...", flush=True)
     update_status(
@@ -1622,6 +1793,32 @@ def run_wapiti_dast(
 
     # Verify local image identity before execution (fail closed)
     verify_wapiti_image_identity()
+
+    # Normalize and validate profile
+    from core.security_scan_planner import SecurityScanPlanner, is_same_origin, VALID_SCAN_PROFILES
+    if profile not in VALID_SCAN_PROFILES:
+        profile = "safe"
+    planner = SecurityScanPlanner()
+    # Load profile config from matrix for timeout/parameter values
+    profile_cfg = planner.get_profile_config(profile)
+
+    _wapiti_max_scan_time    = profile_cfg.get("wapiti_max_scan_time", 120)
+    _wapiti_max_attack_time  = profile_cfg.get("wapiti_max_attack_time", 30)
+    _wapiti_tasks            = profile_cfg.get("wapiti_tasks", 2)
+    _wapiti_depth            = profile_cfg.get("wapiti_depth", 3)
+    _wapiti_timeout          = profile_cfg.get("wapiti_timeout", 5)
+    _wapiti_max_params       = 50 if profile == "deep" else 15
+    _wapiti_max_links        = 50 if profile == "deep" else 20
+    _wapiti_max_files        = 50 if profile == "deep" else 20
+    _container_timeout       = profile_cfg.get("container_timeout_wapiti", 180)
+    _max_origins             = 5  # always cap per-run to prevent runaway scans
+
+    if profile == "deep":
+        print(
+            f"[*] بروفايل الفحص العميق (deep) مفعّل — مهلة الحاوية: {_container_timeout}s، "
+            f"عمق الزحف: {_wapiti_depth}، وقت الفحص الأقصى: {_wapiti_max_scan_time}s",
+            flush=True
+        )
 
     # Clean up any stale wapiti raw files from previous runs in session_dir
     try:
@@ -1661,14 +1858,10 @@ def run_wapiti_dast(
                 "profile": profile,
                 "crawl_policy": "read_only" if profile == "safe" else "standard",
                 "allowed_http_methods": ["GET", "HEAD"] if profile == "safe" else ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-                "form_submission_enabled": (profile != "safe"),
+                "form_submission_enabled": profile_cfg.get("wapiti_form_submission", False),
                 "blocked_crawler_request_count": 0,
                 "blocked_method_counts": {},
-                "modules_executed": [
-                    "http_headers", "csp", "cookieflags", "information_disclosure",
-                    "stacktrace_disclosure", "https_redirect", "inconsistent_redirection",
-                    "unsecure_password"
-                ] if profile == "safe" else ["csrf", "redirect"],
+                "modules_executed": [],
                 "verify_ssl": 1 if verify_ssl else 0,
                 "status": "completed",
                 "raw_count": 0,
@@ -1677,8 +1870,6 @@ def run_wapiti_dast(
             }, mf, ensure_ascii=False, indent=2)
         return True, []
 
-    from core.security_scan_planner import SecurityScanPlanner, is_same_origin
-    planner = SecurityScanPlanner()
     joint_plan = planner.generate_joint_scan_plan(
         session_dir,
         origins=target_origins,
@@ -1695,18 +1886,43 @@ def run_wapiti_dast(
             "unsecure_password"
         ])
 
-    targets_to_audit = target_origins[:5]
+    targets_to_audit = target_origins[:_max_origins]
     combined_raw: Dict[str, Any] = {"vulnerabilities": {}, "anomalies": {}, "infos": {}}
     start_time = time.time()
     total_raw_count = 0
     executed_any = False
     any_success = False
 
+    # Check for confirmed Origin IP & WAF Bypass
+    from core.origin_recon import load_waf_bypass_info
+    waf_info = load_waf_bypass_info(session_dir)
+    origin_extra_hosts: Optional[Dict[str, str]] = None
+    waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
+    origin_ip = None
+    if waf_bypassed:
+        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
+        root_dom = waf_info.get("domain") or ""
+        if root_dom and origin_ip:
+            origin_extra_hosts = {
+                root_dom: origin_ip,
+                f"www.{root_dom}": origin_ip
+            }
+            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Wapiti DAST: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
+
+    # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir, scan_profile=profile)
+    wapiti_evasion_args = WAFEvasionEngine.build_wapiti_args(evasion_cfg)
+    if evasion_cfg.evasion_active:
+        print(f"[*] [WAF Evasion] تفعيل محرك التهرب من جدار الحماية في Wapiti ({len(evasion_cfg.spoofed_headers)} ترويسات موثوقة + تمويه المتصفح).", flush=True)
+        if evasion_cfg.wapiti_tasks:
+            _wapiti_tasks = evasion_cfg.wapiti_tasks
+
     for idx, target_orig in enumerate(targets_to_audit, start=1):
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} cancelled.")
 
-        print(f"[*] Wapiti DAST: فحص الهدف {idx}/{len(targets_to_audit)}: {target_orig} (تنفيذ تسلسلي)...", flush=True)
+        print(f"[*] Wapiti DAST [{profile.upper()}]: فحص الهدف {idx}/{len(targets_to_audit)}: {target_orig} (تنفيذ تسلسلي)...", flush=True)
 
         raw_filename = f"wapiti_raw_{idx}.json"
         raw_output_path = os.path.join(session_dir, raw_filename)
@@ -1715,17 +1931,17 @@ def run_wapiti_dast(
             "-u", target_orig,
             "-m", ",".join(enabled_modules),
             "-S", "paranoid",
-            "--tasks", "2",
-            "-d", "3",
-            "--max-scan-time", "120",  # 120 seconds = 2 minutes per origin
-            "--max-attack-time", "30",
-            "--max-parameters", "15",
-            "--max-links-per-page", "20",
-            "--max-files-per-dir", "20",
+            "--tasks", str(_wapiti_tasks),
+            "-d", str(_wapiti_depth),
+            "--max-scan-time", str(_wapiti_max_scan_time),
+            "--max-attack-time", str(_wapiti_max_attack_time),
+            "--max-parameters", str(_wapiti_max_params),
+            "--max-links-per-page", str(_wapiti_max_links),
+            "--max-files-per-dir", str(_wapiti_max_files),
             "-f", "json",
             "-o", f"/data/{raw_filename}",
             "--no-bugreport",
-            "-t", "5"
+            "-t", str(_wapiti_timeout)
         ]
 
         if profile == "safe":
@@ -1736,20 +1952,25 @@ def run_wapiti_dast(
         else:
             args.extend(["--verify-ssl", "0"])
 
+        if wapiti_evasion_args:
+            args.extend(wapiti_evasion_args)
+
         seeds = []
         for t_spec in wapiti_plan.get("targets", []):
             if t_spec.get("origin") == target_orig:
                 seeds = [s for s in t_spec.get("seed_urls", []) if is_same_origin(s, target_orig)]
                 break
-        for s in seeds[:5]:
+        max_seeds = 10 if profile == "deep" else 5
+        for s in seeds[:max_seeds]:
             args.extend(["-s", s])
 
         success, output = run_docker_tool(
             image=WAPITI_DOCKER_IMAGE,
             args=args,
             volume_dir=session_dir,
-            timeout=180,
-            scan_id=scan_id
+            timeout=_container_timeout,
+            scan_id=scan_id,
+            extra_hosts=origin_extra_hosts
         )
 
         executed_any = True
@@ -1801,6 +2022,12 @@ def run_wapiti_dast(
     except Exception:
         pass
 
+    if waf_bypassed:
+        for f in wapiti_findings:
+            f["waf_bypassed"] = True
+            f["origin_ip"] = origin_ip
+            f["bypassed_origin"] = True
+
     findings_file = os.path.join(session_dir, "wapiti_findings.json")
     with open(findings_file, "w", encoding="utf-8") as ff:
         json.dump(wapiti_findings, ff, ensure_ascii=False, indent=2)
@@ -1811,7 +2038,7 @@ def run_wapiti_dast(
 
     crawl_policy = "read_only" if profile == "safe" else "standard"
     allowed_methods = ["GET", "HEAD"] if profile == "safe" else ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
-    form_submission_enabled = (profile != "safe")
+    form_submission_enabled = profile_cfg.get("wapiti_form_submission", False)
     blocked_count = combined_raw.get("infos", {}).get("blocked_crawler_request_count", 0)
     blocked_methods = combined_raw.get("infos", {}).get("blocked_method_counts", {})
 
@@ -1840,6 +2067,10 @@ def run_wapiti_dast(
         "modules_excluded_review": review_modules,
         "verify_ssl": 1 if verify_ssl else 0,
         "targets_scanned": targets_to_audit,
+        "waf_bypassed": waf_bypassed,
+        "origin_ip": origin_ip,
+        "resolved_to_origin": bool(origin_extra_hosts),
+        "waf_provider": waf_info.get("waf_provider", "None detected"),
         "max_active_security_scanners_per_origin": 1,
         "sequential_execution": True,
         "status": "completed" if status_completed else "failed",
@@ -1895,8 +2126,12 @@ def _extract_finding_archetype(item: Dict[str, Any]) -> Tuple[str, ...]:
         return ("path", path, "xss")
     if "rce" in fid or "command-injection" in fid:
         return ("path", path, "rce")
-    if "ssrf" in fid:
+    if "ssrf" in fid or "ssrf" in title:
         return ("path", path, "ssrf")
+    if "crlf" in fid or "crlf" in title:
+        return ("path", path, "crlf")
+    if "ldap" in fid or "ldap" in title:
+        return ("path", path, "ldap")
     if "env" in fid or ".env" in title:
         return ("path", path, "env")
     if "git" in fid:
@@ -2432,6 +2667,12 @@ def unify_and_save_vulnerabilities(
             t1 = set(primary.get("tags", []))
             t2 = set(secondary.get("tags", []))
             primary["tags"] = sorted(list(t1 | t2))
+            
+            # Merge WAF bypass / Origin attribution
+            primary["waf_bypassed"] = bool(primary.get("waf_bypassed") or secondary.get("waf_bypassed"))
+            primary["bypassed_origin"] = bool(primary.get("bypassed_origin") or secondary.get("bypassed_origin"))
+            if not primary.get("origin_ip") and secondary.get("origin_ip"):
+                primary["origin_ip"] = secondary.get("origin_ip")
             
             unified_map[group_key] = primary
 

@@ -252,6 +252,7 @@ def run_subfinder(domain: str, session_dir: str, scan_id: str) -> Tuple[bool, Li
     return True, valid_subdomains
 
 NAABU_PORTS = "80,81,82,443,444,2082,2083,2086,2087,3000,3001,4000,4200,4433,5000,5001,7001,8000,8008,8080,8081,8082,8083,8090,8181,8443,8500,8834,8888,9000,9090,9200,9443,10000"
+ORIGIN_SENSITIVE_PORTS = "21,22,25,80,81,82,110,143,443,444,2082,2083,2086,2087,3000,3001,3306,3389,4000,4200,4433,5000,5001,5432,6379,7001,8000,8008,8080,8081,8082,8083,8090,8181,8443,8500,8834,8888,9000,9090,9200,9443,10000,27017"
 SCANNED_PORTS = [80, 81, 82, 443, 444, 2082, 2083, 2086, 2087, 3000, 3001, 4000, 4200, 4433, 5000, 5001, 7001, 8000, 8008, 8080, 8081, 8082, 8083, 8090, 8181, 8443, 8500, 8834, 8888, 9000, 9090, 9200, 9443, 10000]
 
 def normalize_target_host(target: str) -> Optional[str]:
@@ -326,6 +327,22 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
             seen_targets.add(norm)
             valid_targets.append(norm)
 
+    # Adaptive Origin Recon: check if verified Origin IP was discovered in Stage 0
+    origin_ip = None
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(session_dir)
+        if waf_info.get("waf_bypassed") and waf_info.get("verified_origins"):
+            origin_ip = waf_info["verified_origins"][0].get("origin_ip")
+            if origin_ip:
+                norm_orig = normalize_target_host(origin_ip)
+                if norm_orig and norm_orig not in seen_targets:
+                    seen_targets.add(norm_orig)
+                    valid_targets.append(norm_orig)
+                    print(f"[+] [Naabu Adaptive] إضافة السيرفر الحقيقي ({norm_orig}) لفحص المنافذ الموسعة والحساسة.", flush=True)
+    except Exception:
+        pass
+
     # Write naabu_targets.txt strictly from current valid targets (using newline="\n" for Linux Docker compatibility)
     if valid_targets:
         with open(naabu_targets_file, "w", encoding="utf-8", newline="\n") as f:
@@ -364,11 +381,12 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
 
     # Calculate timeout based on target volume (min 240 seconds)
     calc_timeout = max(240, len(valid_targets) * 5)
+    scanned_ports_arg = ORIGIN_SENSITIVE_PORTS if origin_ip else NAABU_PORTS
 
     args = [
         "-list", "/data/naabu_targets.txt",
         "-silent",
-        "-p", NAABU_PORTS,
+        "-p", scanned_ports_arg,
         "-s", "c",
         "-duc",
         "-iv", "4",
@@ -525,6 +543,8 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
         "open_endpoint_count": open_endpoint_count,
         "unique_port_count": unique_port_count,
         "scanned_ports": SCANNED_PORTS,
+        "origin_ip": origin_ip,
+        "origin_ports": [p for p in discovered_ports if origin_ip and p.startswith(f"{origin_ip}:")],
         "engine": "naabu",
         "version": "v2.6.1"
     }

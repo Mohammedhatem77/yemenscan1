@@ -126,15 +126,17 @@ class TestPhase1Defects(unittest.TestCase):
         self.assertEqual(len(fake_200s), 0, "run_httpx fabricated synthetic HTTP 200 responses for unreachable hosts!")
         self.assertEqual(active_urls, [], "active_urls should be empty when no server responds!")
 
+    @patch("core.stage3_vulnerabilities.run_docker_tool")
     @patch("core.stage3_vulnerabilities.update_status")
     @patch("core.stage3_vulnerabilities.is_scan_cancelled")
     @patch("requests.get")
-    def test_04_wapiti_no_fake_baseline_on_connection_failure(self, mock_req_get, mock_cancelled, mock_update):
+    def test_04_wapiti_no_fake_baseline_on_connection_failure(self, mock_req_get, mock_cancelled, mock_update, mock_docker):
         """
         3 & 4. Test that run_wapiti_dast does NOT create WAP-AUDIT-BASELINE
         declaring 'No Critical OWASP Misconfigurations' when target connections fail.
         """
         mock_cancelled.return_value = False
+        mock_docker.return_value = (False, "Docker connection failure")
         import requests
         mock_req_get.side_effect = requests.exceptions.ConnectionError("Connection refused")
 

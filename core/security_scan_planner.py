@@ -16,6 +16,10 @@ from core.nuclei_template_selector import (
     RuntimeTemplateMissingError
 )
 
+# ============================================================
+# Wapiti Module Profiles
+# ============================================================
+
 WAPITI_SAFE_MODULES: List[str] = [
     "http_headers",
     "csp",
@@ -32,6 +36,28 @@ WAPITI_DAST_LIGHT_MODULES: List[str] = [
     "redirect"
 ]
 
+# Deep profile: activates non-destructive active injection modules
+# (SQL Boolean/Time-based, Reflected XSS, File Inclusion, SSRF, CRLF, LDAP)
+# for use ONLY on authorised benchmark targets.
+WAPITI_DEEP_MODULES: List[str] = [
+    "http_headers",
+    "csp",
+    "cookieflags",
+    "information_disclosure",
+    "stacktrace_disclosure",
+    "https_redirect",
+    "inconsistent_redirection",
+    "unsecure_password",
+    "csrf",
+    "redirect",
+    "sql",
+    "xss",
+    "file",
+    "ssrf",
+    "crlf",
+    "ldap"
+]
+
 WAPITI_VERIFIED_PASSIVE_MODULES: Set[str] = {
     "http_headers",
     "csp",
@@ -42,6 +68,9 @@ WAPITI_VERIFIED_PASSIVE_MODULES: Set[str] = {
     "inconsistent_redirection",
     "unsecure_password"
 }
+
+# Valid scan profiles for validation
+VALID_SCAN_PROFILES: Set[str] = {"safe", "dast_light", "deep"}
 
 def is_same_origin(seed_url: str, target_orig: str) -> bool:
     """Verifies that seed_url shares the exact same scheme, hostname, and port as target_orig."""
@@ -95,7 +124,7 @@ class SecurityScanPlanner:
         for cap_name, details in capabilities.items():
             status = details.get("coverage_status", "covered_default")
             primary = details.get("primary", "none").lower()
-            if status in ("covered_default", "covered_optional"):
+            if status in ("covered_default", "covered_optional", "covered_deep"):
                 if not primary or primary == "none":
                     duplicates.append(f"Missing primary scanner for covered capability '{cap_name}'")
                     continue
@@ -118,6 +147,17 @@ class SecurityScanPlanner:
                     res.append(k)
         return res
 
+    def get_profile_config(self, profile: str) -> Dict[str, Any]:
+        """
+        Returns the configuration block for a given scan profile from the matrix.
+        Falls back to 'safe' profile defaults if the profile is not found.
+        """
+        profiles = self.matrix.get("scan_profiles", {})
+        cfg = profiles.get(profile)
+        if cfg is None:
+            cfg = profiles.get("safe", {})
+        return cfg
+
     def generate_joint_scan_plan(
         self,
         session_dir: str,
@@ -132,6 +172,10 @@ class SecurityScanPlanner:
         Builds the unified, non-overlapping Joint Security Scan Plan
         generating joint_scan_plan.json, nuclei_scan_plan.json, and wapiti_scan_plan.json.
         """
+        # Validate profile
+        if wapiti_profile not in VALID_SCAN_PROFILES:
+            wapiti_profile = "safe"
+
         is_valid, duplicates = self.validate_capability_ownership()
         if not is_valid:
             raise ValueError(f"Capability ownership conflict detected: {duplicates}")
@@ -141,6 +185,9 @@ class SecurityScanPlanner:
         if api_endpoints_file is None:
             api_endpoints_file = os.path.join(session_dir, "api_endpoints.txt")
 
+        # Load profile config from matrix
+        profile_cfg = self.get_profile_config(wapiti_profile)
+
         # 1. Load active endpoint records
         active_records: List[Dict[str, Any]] = []
         if os.path.exists(active_urls_json):
@@ -149,7 +196,11 @@ class SecurityScanPlanner:
                     for line in f:
                         if line.strip():
                             try:
-                                active_records.append(json.loads(line.strip()))
+                                item = json.loads(line.strip())
+                                if isinstance(item, list):
+                                    active_records.extend([x for x in item if isinstance(x, dict)])
+                                elif isinstance(item, dict):
+                                    active_records.append(item)
                             except Exception:
                                 pass
             except Exception:
@@ -179,7 +230,6 @@ class SecurityScanPlanner:
         for r in api_routes:
             p = urlparse(r)
             if p.netloc:
-                cand_orig = f"{p.scheme or 'http'}://{p.netloc}"
                 for orig in origins:
                     if is_same_origin(r, orig):
                         seeds_by_origin.setdefault(orig, []).append(r)
@@ -195,8 +245,20 @@ class SecurityScanPlanner:
         excluded_review = self.matrix.get("wapiti_active_attack_modules_review", [])
 
         # Select modules according to profile
-        if wapiti_profile == "dast_light":
+        if wapiti_profile == "deep":
+            enabled_modules = list(WAPITI_DEEP_MODULES)
+            # In deep profile, active injection modules are intentionally included
+            # Remove them from the excluded_review list to allow execution
+            excluded_review = [
+                m for m in excluded_review
+                if m not in {"sql", "xss", "file", "ssrf", "crlf", "ldap", "redirect", "csrf"}
+            ]
+        elif wapiti_profile == "dast_light":
             enabled_modules = list(WAPITI_DAST_LIGHT_MODULES)
+            excluded_review = [
+                m for m in excluded_review
+                if m not in {"csrf", "redirect"}
+            ]
         else:
             wapiti_profile = "safe"
             enabled_modules = list(WAPITI_SAFE_MODULES)
@@ -204,12 +266,13 @@ class SecurityScanPlanner:
         wapiti_targets = []
         for orig in origins:
             raw_seeds = seeds_by_origin.get(orig, [])
-            # Deduplicate and strictly validate same-origin; max 5 seeds per origin
+            # Deduplicate and strictly validate same-origin; max 10 seeds in deep, 5 otherwise
+            max_seeds = 10 if wapiti_profile == "deep" else 5
             valid_seeds: List[str] = []
             for s in raw_seeds:
                 if is_same_origin(s, orig) and s not in valid_seeds:
                     valid_seeds.append(s)
-                if len(valid_seeds) >= 5:
+                if len(valid_seeds) >= max_seeds:
                     break
 
             wapiti_targets.append({
@@ -218,6 +281,13 @@ class SecurityScanPlanner:
                 "seed_urls": valid_seeds,
                 "seed_count": len(valid_seeds)
             })
+
+        # Determine crawl policy based on profile
+        is_read_only = (wapiti_profile == "safe")
+        allowed_methods = (
+            ["GET", "HEAD"] if is_read_only
+            else ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+        )
 
         wapiti_plan = {
             "tool": "wapiti",
@@ -228,9 +298,9 @@ class SecurityScanPlanner:
             "image_id": "sha256:611a8feb8521736d9b91a5776db861323b89ae401909683476c65f239f0dace1",
             "repository_digest": None,
             "profile": wapiti_profile,
-            "crawl_policy": "read_only" if wapiti_profile == "safe" else "standard",
-            "allowed_http_methods": ["GET", "HEAD"] if wapiti_profile == "safe" else ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            "form_submission_enabled": (wapiti_profile != "safe"),
+            "crawl_policy": "read_only" if is_read_only else "standard",
+            "allowed_http_methods": allowed_methods,
+            "form_submission_enabled": profile_cfg.get("wapiti_form_submission", False),
             "execution_policy": {
                 "max_active_security_scanners_per_origin": 1,
                 "sequential_after": "nuclei"
@@ -240,14 +310,14 @@ class SecurityScanPlanner:
             "excluded_review_modules": excluded_review,
             "configuration": {
                 "scan_profile": "paranoid",
-                "tasks": 2,
-                "max_depth": 3,
-                "max_scan_time_seconds": 120,
-                "max_attack_time_seconds": 30,
-                "max_parameters": 15,
-                "max_links_per_page": 20,
-                "max_files_per_dir": 20,
-                "timeout_seconds": 5,
+                "tasks": profile_cfg.get("wapiti_tasks", 2),
+                "max_depth": profile_cfg.get("wapiti_depth", 3),
+                "max_scan_time_seconds": profile_cfg.get("wapiti_max_scan_time", 120),
+                "max_attack_time_seconds": profile_cfg.get("wapiti_max_attack_time", 30),
+                "max_parameters": 50 if wapiti_profile == "deep" else 15,
+                "max_links_per_page": 50 if wapiti_profile == "deep" else 20,
+                "max_files_per_dir": 50 if wapiti_profile == "deep" else 20,
+                "timeout_seconds": profile_cfg.get("wapiti_timeout", 5),
                 "verify_ssl": 1 if verify_ssl else 0,
                 "no_bugreport": True,
                 "format": "json"

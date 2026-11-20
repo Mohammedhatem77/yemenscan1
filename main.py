@@ -139,6 +139,7 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 class ScanRequest(BaseModel):
     domain: Optional[str] = None
     target: Optional[str] = None
+    scan_profile: Optional[str] = "safe"  # 'safe' | 'dast_light' | 'deep'
 
 class Stage1RunRequest(BaseModel):
     domain: Optional[str] = None
@@ -163,10 +164,15 @@ class StandaloneNucleiReq(BaseModel):
     target_url: str
     severity: Optional[str] = "medium,high,critical"
     category: Optional[str] = None
+    tags: Optional[str] = None
 
 class StandaloneWapitiReq(BaseModel):
     target_url: str
     modules: Optional[str] = None
+    profile: Optional[str] = "safe"  # 'safe' | 'dast_light' | 'deep'
+
+class OriginReconReq(BaseModel):
+    domain: str
 
 class NucleiScanRequest(BaseModel):
     target: str
@@ -310,6 +316,7 @@ def get_system_health(db: Session = Depends(get_db)):
 def start_scan(
     background_tasks: BackgroundTasks,
     domain: Optional[str] = Query(None),
+    scan_profile: Optional[str] = Query(None),
     request: Optional[ScanRequest] = None,
     db: Session = Depends(get_db)
 ):
@@ -317,8 +324,20 @@ def start_scan(
     Starts an end-to-end security assessment across Phase 1, Phase 2, and Phase 3.
     Accepts target domain via query parameter ?domain=... OR JSON body {"domain": "..."}.
     Enforces strict RFC syntax, public TLD validation, and active DNS resolution before starting.
+
+    scan_profile: 'safe' (default) | 'dast_light' | 'deep'
+      - safe:       Passive checks only. No form submission. Fast.
+      - dast_light: Adds CSRF + open-redirect form testing. Medium depth.
+      - deep:       Full non-destructive injection suite (SQLi, XSS, LFI, SSRF, CRLF, LDAP).
+                    For authorised/benchmark targets ONLY. Extended timeouts.
     """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
     target_raw = None
+    # Resolve scan_profile from query or body
+    effective_profile = "safe"
+    if isinstance(scan_profile, str) and scan_profile.strip() in _VALID_PROFILES:
+        effective_profile = scan_profile.strip()
+
     if isinstance(domain, str) and domain.strip():
         target_raw = domain.strip()
     elif request:
@@ -326,6 +345,8 @@ def start_scan(
             target_raw = request.domain.strip()
         elif isinstance(request.target, str) and request.target.strip():
             target_raw = request.target.strip()
+        if isinstance(request.scan_profile, str) and request.scan_profile.strip() in _VALID_PROFILES:
+            effective_profile = request.scan_profile.strip()
         
     if not target_raw:
         raise HTTPException(
@@ -347,16 +368,17 @@ def start_scan(
     except Exception as e:
         print(f"[!] Warning: Could not register scan session in DB: {e}", flush=True)
 
-    print(f"\n[*] تم التحقق بنجاح من النطاق ({clean_domain} -> {resolved_ips}). تشغيل أدوات الفحص في الخلفية...", flush=True)
+    print(f"\n[*] تم التحقق بنجاح من النطاق ({clean_domain} -> {resolved_ips}). تشغيل أدوات الفحص في الخلفية (profile={effective_profile})...", flush=True)
     
     # 3. Pass to distributed execution (Celery worker with BackgroundTasks fallback)
-    dispatch_scan_pipeline(clean_domain, scan_id, background_tasks=background_tasks)
+    dispatch_scan_pipeline(clean_domain, scan_id, scan_profile=effective_profile, background_tasks=background_tasks)
     
     return {
         "status": "success",
         "scan_id": scan_id,
         "target_domain": clean_domain,
         "resolved_ips": resolved_ips,
+        "scan_profile": effective_profile,
         "message": f"تم التحقق بنجاح من النطاق '{clean_domain}'. بدأت منظومة الفحص الأمني العمل في الخلفية.",
         "phases": [
             "المرحلة الأولى: Subfinder (النطاقات) + Naabu (المنافذ)",
@@ -463,18 +485,33 @@ def run_stage2_endpoint(scan_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/scans/{scan_id}/stages/stage3", tags=["1. خط الفحص المتسلسل ومراحله (Sequential Pipeline & Stages)"])
-def run_stage3_endpoint(scan_id: str, background_tasks: BackgroundTasks):
-    """تشغيل المرحلة الثالثة فقط (Nuclei + Wapiti) لجلسة الفحص المحددة."""
+def run_stage3_endpoint(
+    scan_id: str,
+    background_tasks: BackgroundTasks,
+    scan_profile: Optional[str] = Query("safe", description="'safe' | 'dast_light' | 'deep'")
+):
+    """تشغيل المرحلة الثالثة فقط (Nuclei + Wapiti) لجلسة الفحص المحددة.
+    
+    scan_profile: 'safe' (افتراضي) | 'dast_light' | 'deep'
+      - safe:       فحص سلبي فقط — رؤوس وإعدادات. بدون إرسال نماذج. سريع.
+      - dast_light: يضيف اختبار CSRF + Open Redirect للنماذج. عمق متوسط.
+      - deep:       مجموعة حقن كاملة غير مدمرة (SQLi, XSS, LFI, SSRF, CRLF, LDAP).
+                    للأهداف المرخصة وبيئات الاختبار القياسية فقط. مهلات ممتدة.
+    """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    effective_profile = scan_profile if scan_profile in _VALID_PROFILES else "safe"
+
     status = get_status(scan_id)
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
 
-    dispatch_stage3(scan_id, background_tasks=background_tasks)
+    dispatch_stage3(scan_id, scan_profile=effective_profile, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,
         "stage": "stage3_vulnerabilities",
-        "message": "بدأ تنفيذ المرحلة الثالثة (فحص الثغرات الأمنية المتكامل) في الخلفية."
+        "scan_profile": effective_profile,
+        "message": f"بدأ تنفيذ المرحلة الثالثة (فحص الثغرات الأمنية المتكامل) بملف تعريف [{effective_profile.upper()}] في الخلفية."
     }
 
 
@@ -632,6 +669,16 @@ def get_scan_status(scan_id: Optional[str] = None, db: Session = Depends(get_db)
 
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
+
+    # Enrich status with real-time WAF bypass intelligence
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(get_session_dir(scan_id))
+        if waf_info and waf_info.get("status") != "none":
+            status["waf_bypass"] = waf_info
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "data": status
@@ -791,6 +838,9 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
                     "cvss_score": cvss_score,
                     "cvss_vector": cvss_vector,
                     "owasp_category": owasp_cat,
+                    "waf_bypassed": bool(raw.get("waf_bypassed", False)),
+                    "origin_ip": raw.get("origin_ip"),
+                    "bypassed_origin": bool(raw.get("bypassed_origin", False)),
                     "discovered_at": finding.discovered_at.isoformat() if finding.discovered_at else None,
                     "raw_output": raw
                 })
@@ -841,12 +891,21 @@ def get_vulnerabilities(scan_id: Optional[str] = None, db: Session = Depends(get
     except Exception:
         pass
 
+    # Load WAF bypass information for session
+    waf_info = {}
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(get_session_dir(active_scan_id))
+    except Exception:
+        pass
+
     return {
         "status": "success",
         "scan_id": active_scan_id,
         "total_vulnerabilities_found": len(results),
         "vulnerabilities": results,
         "data": results,
+        "waf_bypass": waf_info,
         "triage_suppressed_count": triage_suppressed_count,
         "triage_canonicalized_count": triage_canonicalized_count,
         "triage_summary": triage_summary,
@@ -1155,6 +1214,7 @@ def get_nuclei_info():
     """Returns Nuclei engine status and installed templates breakdown."""
     from core.runner import is_docker_available
     from core.stage3_vulnerabilities import get_nuclei_templates_info
+    from core.template_updater import count_templates
     
     templates = get_nuclei_templates_info()
     categories = {}
@@ -1166,7 +1226,7 @@ def get_nuclei_info():
         "status": "success",
         "engine": "Nuclei v3.11.1 (Docker & Native Engine)",
         "docker_available": is_docker_available(),
-        "total_templates": len(templates),
+        "total_templates": count_templates(),
         "categories": categories,
         "templates": templates
     }
@@ -1277,9 +1337,14 @@ def run_standalone_kiterunner_endpoint(req: StandaloneKiterunnerReq):
 @app.post("/api/tools/nuclei", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_nuclei_endpoint(req: StandaloneNucleiReq):
     """تشغيل Nuclei المستقل لفحص الثغرات وفق قوالب محددة ودرجات الخطورة."""
-    if not req.target_url or not req.target_url.strip().startswith("http"):
-        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    return run_standalone_nuclei(req.target_url, severity=req.severity)
+    if not req.target_url or len(req.target_url.strip()) < 3:
+        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب أو نطاق صالح للفحص.")
+    return run_standalone_nuclei(
+        target_url=req.target_url,
+        severity=req.severity,
+        category=req.category,
+        tags=req.tags
+    )
 
 
 @app.post("/api/tools/wapiti", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
@@ -1287,13 +1352,39 @@ def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
     """تشغيل Wapiti المستقل للفحص الديناميكي للثغرات الحركية (DAST)."""
     if not req.target_url or not req.target_url.strip().startswith("http"):
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    return run_standalone_wapiti(req.target_url, modules=req.modules)
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    prof = req.profile if req.profile in _VALID_PROFILES else "safe"
+    return run_standalone_wapiti(req.target_url, modules=req.modules, profile=prof)
 
 
 @app.get("/api/tools/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def get_tools_status_endpoint():
     """التحقق من جاهزية وحالة الحاويات الست والأدوات في النظام."""
     return get_tools_readiness_status()
+
+
+@app.post("/api/tools/origin-ip", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
+def run_origin_recon_endpoint(req: OriginReconReq):
+    """كشف السيرفر الحقيقي (Origin IP) وتجاوز جدران الحماية (WAF Bypass)."""
+    from core.origin_recon import run_origin_recon
+    if not req.domain or len(req.domain.strip()) < 3:
+        raise HTTPException(status_code=400, detail="يرجى إدخال نطاق صالح لاستكشاف الأصل.")
+    return run_origin_recon(req.domain.strip())
+
+
+@app.get("/api/templates/status", tags=["4. إدارة وتحديث القوالب (Template Management)"])
+def get_templates_status_endpoint():
+    """عرض إحصائيات وحالة قوالب Nuclei المتاحة وتاريخ آخر تحديث."""
+    from core.template_updater import get_template_status
+    return get_template_status()
+
+
+@app.post("/api/templates/update", tags=["4. إدارة وتحديث القوالب (Template Management)"])
+def update_templates_endpoint(background_tasks: BackgroundTasks):
+    """إطلاق مهمة تحديث القوالب في الخلفية عبر سيليري مع بيئة التحقق والفرز."""
+    from core.tasks import dispatch_template_update
+    return dispatch_template_update(background_tasks=background_tasks)
+
 
 
 class SaveStandaloneReq(BaseModel):
@@ -2688,6 +2779,13 @@ def export_scan_json(
             pass
     target_domain = target_domain or ""
 
+    waf_info = {}
+    try:
+        from core.origin_recon import load_waf_bypass_info
+        waf_info = load_waf_bypass_info(session_dir)
+    except Exception:
+        pass
+
     export_data = {
         "assessment_meta": {
             "platform": "YemenScan Cyber Security Platform",
@@ -2699,6 +2797,7 @@ def export_scan_json(
             "status": status.get("current_stage", ""),
             "is_completed": status.get("is_completed", False)
         },
+        "waf_bypass": waf_info,
         "stats": status.get("stats", {
             "subdomains_count": len(subdomains),
             "open_ports_count": len(ports),
