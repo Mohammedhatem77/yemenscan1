@@ -1,10 +1,72 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "YemenScan Coverage Ownership Matrix enforcing single primary scanner per capability family without phantom coverage",
   "rules": {
     "single_primary_scanner": true,
     "disallow_duplicate_families": true,
     "no_phantom_coverage": true
+  },
+  "scan_profiles": {
+    "safe": {
+      "description": "بروفايل الفحص الآمن الافتراضي: يستخدم قوالب Nuclei الموثوقة وفحص رؤوس HTTP ولا يحقن أي حمولات هجومية في النماذج",
+      "wapiti_form_submission": false,
+      "wapiti_max_scan_time": 120,
+      "wapiti_max_attack_time": 30,
+      "wapiti_tasks": 2,
+      "wapiti_depth": 3,
+      "wapiti_timeout": 5,
+      "nuclei_rate_limit": 10,
+      "nuclei_concurrency": 5,
+      "nuclei_timeout": 5,
+      "nuclei_retries": 0,
+      "nuclei_exclude_tags": ["dos", "fuzz", "bruteforce", "intrusive", "local"],
+      "container_timeout_wapiti": 180,
+      "container_timeout_nuclei_per_template": 8,
+      "container_timeout_nuclei_min": 180,
+      "container_timeout_nuclei_max": 600,
+      "celery_soft_time_limit": 1800,
+      "celery_time_limit": 2400
+    },
+    "dast_light": {
+      "description": "بروفايل فحص CSRF والإعادات — يضيف وحدات csrf و redirect لاختبار النماذج بشكل آمن",
+      "wapiti_form_submission": true,
+      "wapiti_max_scan_time": 240,
+      "wapiti_max_attack_time": 60,
+      "wapiti_tasks": 3,
+      "wapiti_depth": 4,
+      "wapiti_timeout": 8,
+      "nuclei_rate_limit": 20,
+      "nuclei_concurrency": 10,
+      "nuclei_timeout": 8,
+      "nuclei_retries": 1,
+      "nuclei_exclude_tags": ["dos", "bruteforce", "intrusive", "local"],
+      "container_timeout_wapiti": 360,
+      "container_timeout_nuclei_per_template": 10,
+      "container_timeout_nuclei_min": 300,
+      "container_timeout_nuclei_max": 900,
+      "celery_soft_time_limit": 3600,
+      "celery_time_limit": 4500
+    },
+    "deep": {
+      "description": "بروفايل الفحص العميق: يفعّل اختبار النماذج الكامل (SQL Injection, XSS, File Inclusion, SSRF) مع تقليص معدل الطلبات لتجاوز الـ WAF وضمان الدقة القصوى. مخصص للبيئات المرخصة والهدف المعملي.",
+      "wapiti_form_submission": true,
+      "wapiti_max_scan_time": 1800,
+      "wapiti_max_attack_time": 600,
+      "wapiti_tasks": 2,
+      "wapiti_depth": 6,
+      "wapiti_timeout": 15,
+      "nuclei_rate_limit": 10,
+      "nuclei_concurrency": 3,
+      "nuclei_timeout": 10,
+      "nuclei_retries": 2,
+      "nuclei_exclude_tags": ["dos", "bruteforce", "intrusive", "local"],
+      "container_timeout_wapiti": 2700,
+      "container_timeout_nuclei_per_template": 15,
+      "container_timeout_nuclei_min": 600,
+      "container_timeout_nuclei_max": 2700,
+      "celery_soft_time_limit": 7200,
+      "celery_time_limit": 9000
+    }
   },
   "capabilities": {
     "known_cve_signature": {
@@ -159,60 +221,76 @@
       "reason": "Active classLoader payload probe excluded from default safe scan policy"
     },
     "sql_injection": {
-      "primary": "none",
+      "primary": "wapiti",
       "module": "sql",
-      "profile": "none",
-      "coverage_status": "disabled_safety",
-      "description": "Active error-based and boolean-based SQL injection excluded from safe default policy",
-      "reason": "Active injection attack excluded from default safe scan policy"
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "Non-destructive boolean-based & time-based SQL injection proof-of-concept via Wapiti form crawling. Enabled in 'deep' profile only on authorised targets.",
+      "reason": "Active injection — enabled only in deep profile on authorised targets"
     },
     "command_execution": {
       "primary": "none",
       "module": "exec",
       "profile": "none",
       "coverage_status": "disabled_safety",
-      "description": "Active OS command and code execution fuzzing excluded from safe default policy",
-      "reason": "Active code execution attack excluded from default safe scan policy"
+      "description": "Active OS command and code execution fuzzing excluded from all profiles",
+      "reason": "Active code execution attack excluded from all scan profiles — destructive"
     },
     "file_inclusion": {
-      "primary": "none",
+      "primary": "wapiti",
       "module": "file",
-      "profile": "none",
-      "coverage_status": "disabled_safety",
-      "description": "Active path traversal and local/remote file inclusion excluded from safe default policy",
-      "reason": "Active path traversal attack excluded from default safe scan policy"
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "Path traversal and local file inclusion verification via Wapiti crawler. Enabled in 'deep' profile only on authorised targets.",
+      "reason": "Active path traversal — enabled only in deep profile on authorised targets"
     },
     "cross_site_scripting": {
-      "primary": "none",
+      "primary": "wapiti",
       "module": "xss",
-      "profile": "none",
-      "coverage_status": "disabled_safety",
-      "description": "Active reflected and stored XSS payload injection excluded from safe default policy",
-      "reason": "Active script injection attack excluded from default safe scan policy"
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "Reflected XSS payload injection in form fields via Wapiti. Non-persistent probes. Enabled in 'deep' profile only on authorised targets.",
+      "reason": "Active XSS injection — enabled only in deep profile on authorised targets"
     },
     "server_side_request_forgery": {
-      "primary": "none",
+      "primary": "wapiti",
       "module": "ssrf",
-      "profile": "none",
-      "coverage_status": "disabled_safety",
-      "description": "Active SSRF out-of-band injection excluded from safe default policy",
-      "reason": "Active SSRF injection attack excluded from default safe scan policy"
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "SSRF verification via Wapiti redirect and URL parameter probing. Enabled in 'deep' profile only on authorised targets.",
+      "reason": "Active SSRF probe — enabled only in deep profile on authorised targets"
     },
     "xml_external_entity": {
       "primary": "none",
       "module": "xxe",
       "profile": "none",
       "coverage_status": "disabled_safety",
-      "description": "Active XML External Entity injection excluded from safe default policy",
-      "reason": "Active XXE injection attack excluded from default safe scan policy"
+      "description": "Active XML External Entity injection excluded from all profiles — OOB callback required",
+      "reason": "Requires out-of-band callback infrastructure — excluded from all profiles"
     },
     "file_upload": {
       "primary": "none",
       "module": "upload",
       "profile": "none",
       "coverage_status": "disabled_safety",
-      "description": "Active arbitrary file upload fuzzing excluded from safe default policy",
-      "reason": "Active file upload attack excluded from default safe scan policy"
+      "description": "Active arbitrary file upload fuzzing excluded from all profiles",
+      "reason": "Potentially destructive — excluded from all scan profiles"
+    },
+    "crlf_injection": {
+      "primary": "wapiti",
+      "module": "crlf",
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "CRLF injection in HTTP headers and URL parameters. Enabled in 'deep' profile only.",
+      "reason": "Active header injection — enabled only in deep profile on authorised targets"
+    },
+    "ldap_injection": {
+      "primary": "wapiti",
+      "module": "ldap",
+      "profile": "deep",
+      "coverage_status": "covered_deep",
+      "description": "LDAP injection in form fields. Enabled in 'deep' profile only on authorised targets.",
+      "reason": "Active LDAP injection — enabled only in deep profile on authorised targets"
     }
   },
   "wapiti_disabled_redundant_modules": [

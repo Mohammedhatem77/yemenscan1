@@ -105,14 +105,23 @@ def package_session_evidence_and_metadata(
     except Exception as e:
         print(f"[-] ملاحظة: تعذر أرشفة الأدلة الخام والميتاداتا: {e}", flush=True)
 
-def run_full_pipeline(domain: str, scan_id: str) -> None:
+def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> None:
     """
     Executes the end-to-end 3-phase Black-box attack surface management pipeline:
     1. Phase 1: Subfinder (Subdomains) -> Naabu (Ports)
     2. Phase 2: HTTPX (Live Web Servers) -> Kiterunner (API & Route Discovery)
     3. Phase 3: Nuclei (CVEs & OWASP API Top 10) + Wapiti (DAST Web Top 10) -> Unified Report
     Supports real-time cancellation, preserves stage assets, and honors tool outcomes.
+
+    Args:
+        domain: Target domain to scan.
+        scan_id: Session ID.
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Controls tool timeouts,
+                      rate limits, concurrency, and DAST module injection depth.
     """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    if scan_profile not in _VALID_PROFILES:
+        scan_profile = "safe"
     session_dir = get_session_dir(scan_id)
     tool_statuses: Dict[str, str] = {}
     phase_completed = {"phase1": False, "phase2": False, "phase3": False}
@@ -289,7 +298,10 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
         if in_scope_urls and all_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+            try:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id, scan_profile=scan_profile)
+            except TypeError:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
             if ok_nuc:
                 tool_statuses["nuclei"] = "success" if nuclei_findings else "empty"
             else:
@@ -314,7 +326,10 @@ def run_full_pipeline(domain: str, scan_id: str) -> None:
         if dast_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
+            try:
+                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets, profile=scan_profile)
+            except TypeError:
+                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
             if ok_wap:
                 tool_statuses["wapiti"] = "success" if wapiti_findings else "empty"
             else:

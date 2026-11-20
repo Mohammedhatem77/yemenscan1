@@ -139,6 +139,7 @@ os.makedirs(TEMPLATES_DIR, exist_ok=True)
 class ScanRequest(BaseModel):
     domain: Optional[str] = None
     target: Optional[str] = None
+    scan_profile: Optional[str] = "safe"  # 'safe' | 'dast_light' | 'deep'
 
 class Stage1RunRequest(BaseModel):
     domain: Optional[str] = None
@@ -168,6 +169,7 @@ class StandaloneNucleiReq(BaseModel):
 class StandaloneWapitiReq(BaseModel):
     target_url: str
     modules: Optional[str] = None
+    profile: Optional[str] = "safe"  # 'safe' | 'dast_light' | 'deep'
 
 class OriginReconReq(BaseModel):
     domain: str
@@ -314,6 +316,7 @@ def get_system_health(db: Session = Depends(get_db)):
 def start_scan(
     background_tasks: BackgroundTasks,
     domain: Optional[str] = Query(None),
+    scan_profile: Optional[str] = Query(None),
     request: Optional[ScanRequest] = None,
     db: Session = Depends(get_db)
 ):
@@ -321,8 +324,20 @@ def start_scan(
     Starts an end-to-end security assessment across Phase 1, Phase 2, and Phase 3.
     Accepts target domain via query parameter ?domain=... OR JSON body {"domain": "..."}.
     Enforces strict RFC syntax, public TLD validation, and active DNS resolution before starting.
+
+    scan_profile: 'safe' (default) | 'dast_light' | 'deep'
+      - safe:       Passive checks only. No form submission. Fast.
+      - dast_light: Adds CSRF + open-redirect form testing. Medium depth.
+      - deep:       Full non-destructive injection suite (SQLi, XSS, LFI, SSRF, CRLF, LDAP).
+                    For authorised/benchmark targets ONLY. Extended timeouts.
     """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
     target_raw = None
+    # Resolve scan_profile from query or body
+    effective_profile = "safe"
+    if isinstance(scan_profile, str) and scan_profile.strip() in _VALID_PROFILES:
+        effective_profile = scan_profile.strip()
+
     if isinstance(domain, str) and domain.strip():
         target_raw = domain.strip()
     elif request:
@@ -330,6 +345,8 @@ def start_scan(
             target_raw = request.domain.strip()
         elif isinstance(request.target, str) and request.target.strip():
             target_raw = request.target.strip()
+        if isinstance(request.scan_profile, str) and request.scan_profile.strip() in _VALID_PROFILES:
+            effective_profile = request.scan_profile.strip()
         
     if not target_raw:
         raise HTTPException(
@@ -351,16 +368,17 @@ def start_scan(
     except Exception as e:
         print(f"[!] Warning: Could not register scan session in DB: {e}", flush=True)
 
-    print(f"\n[*] تم التحقق بنجاح من النطاق ({clean_domain} -> {resolved_ips}). تشغيل أدوات الفحص في الخلفية...", flush=True)
+    print(f"\n[*] تم التحقق بنجاح من النطاق ({clean_domain} -> {resolved_ips}). تشغيل أدوات الفحص في الخلفية (profile={effective_profile})...", flush=True)
     
     # 3. Pass to distributed execution (Celery worker with BackgroundTasks fallback)
-    dispatch_scan_pipeline(clean_domain, scan_id, background_tasks=background_tasks)
+    dispatch_scan_pipeline(clean_domain, scan_id, scan_profile=effective_profile, background_tasks=background_tasks)
     
     return {
         "status": "success",
         "scan_id": scan_id,
         "target_domain": clean_domain,
         "resolved_ips": resolved_ips,
+        "scan_profile": effective_profile,
         "message": f"تم التحقق بنجاح من النطاق '{clean_domain}'. بدأت منظومة الفحص الأمني العمل في الخلفية.",
         "phases": [
             "المرحلة الأولى: Subfinder (النطاقات) + Naabu (المنافذ)",
@@ -467,18 +485,33 @@ def run_stage2_endpoint(scan_id: str, background_tasks: BackgroundTasks):
 
 
 @app.post("/api/scans/{scan_id}/stages/stage3", tags=["1. خط الفحص المتسلسل ومراحله (Sequential Pipeline & Stages)"])
-def run_stage3_endpoint(scan_id: str, background_tasks: BackgroundTasks):
-    """تشغيل المرحلة الثالثة فقط (Nuclei + Wapiti) لجلسة الفحص المحددة."""
+def run_stage3_endpoint(
+    scan_id: str,
+    background_tasks: BackgroundTasks,
+    scan_profile: Optional[str] = Query("safe", description="'safe' | 'dast_light' | 'deep'")
+):
+    """تشغيل المرحلة الثالثة فقط (Nuclei + Wapiti) لجلسة الفحص المحددة.
+    
+    scan_profile: 'safe' (افتراضي) | 'dast_light' | 'deep'
+      - safe:       فحص سلبي فقط — رؤوس وإعدادات. بدون إرسال نماذج. سريع.
+      - dast_light: يضيف اختبار CSRF + Open Redirect للنماذج. عمق متوسط.
+      - deep:       مجموعة حقن كاملة غير مدمرة (SQLi, XSS, LFI, SSRF, CRLF, LDAP).
+                    للأهداف المرخصة وبيئات الاختبار القياسية فقط. مهلات ممتدة.
+    """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    effective_profile = scan_profile if scan_profile in _VALID_PROFILES else "safe"
+
     status = get_status(scan_id)
     if not status:
         raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
 
-    dispatch_stage3(scan_id, background_tasks=background_tasks)
+    dispatch_stage3(scan_id, scan_profile=effective_profile, background_tasks=background_tasks)
     return {
         "status": "started",
         "scan_id": scan_id,
         "stage": "stage3_vulnerabilities",
-        "message": "بدأ تنفيذ المرحلة الثالثة (فحص الثغرات الأمنية المتكامل) في الخلفية."
+        "scan_profile": effective_profile,
+        "message": f"بدأ تنفيذ المرحلة الثالثة (فحص الثغرات الأمنية المتكامل) بملف تعريف [{effective_profile.upper()}] في الخلفية."
     }
 
 
@@ -1319,7 +1352,9 @@ def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
     """تشغيل Wapiti المستقل للفحص الديناميكي للثغرات الحركية (DAST)."""
     if not req.target_url or not req.target_url.strip().startswith("http"):
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    return run_standalone_wapiti(req.target_url, modules=req.modules)
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    prof = req.profile if req.profile in _VALID_PROFILES else "safe"
+    return run_standalone_wapiti(req.target_url, modules=req.modules, profile=prof)
 
 
 @app.get("/api/tools/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])

@@ -29,18 +29,19 @@ logger = logging.getLogger("yemenscan.tasks")
 # Celery Asynchronous Tasks
 # ---------------------------------------------------------------------------
 
-@celery_app.task(bind=True, name="yemenscan.tasks.full_scan_pipeline")
-def celery_run_full_pipeline(self, domain: str, scan_id: str):
+@celery_app.task(bind=True, name="yemenscan.tasks.full_scan_pipeline",
+                 soft_time_limit=1800, time_limit=2400)
+def celery_run_full_pipeline(self, domain: str, scan_id: str, scan_profile: str = "safe"):
     """Executes the full pipeline via Celery worker and ingests into DB."""
-    logger.info("[Celery Worker] Starting full scan for %s (Scan ID: %s)", domain, scan_id)
+    logger.info("[Celery Worker] Starting full scan for %s (Scan ID: %s, Profile: %s)", domain, scan_id, scan_profile)
     try:
-        run_full_pipeline(domain, scan_id)
+        run_full_pipeline(domain, scan_id, scan_profile=scan_profile)
         try:
             with SessionLocal() as db:
                 ingest_scan_from_directory(db, scan_id, domain=domain)
         except Exception as db_err:
             logger.error("[Celery Worker] DB ingestion error for %s: %s", scan_id, db_err)
-        return {"status": "success", "scan_id": scan_id, "domain": domain}
+        return {"status": "success", "scan_id": scan_id, "domain": domain, "scan_profile": scan_profile}
     except Exception as e:
         logger.error("[Celery Worker] Error in full scan %s: %s", scan_id, e)
         try:
@@ -63,10 +64,18 @@ def celery_run_stage2(self, scan_id: str):
     return run_stage2_pipeline(scan_id)
 
 
-@celery_app.task(bind=True, name="yemenscan.tasks.stage3_vulnerabilities")
-def celery_run_stage3(self, scan_id: str):
-    """Executes stage 3 (Vulnerabilities) via Celery worker."""
-    return run_stage3_pipeline(scan_id)
+@celery_app.task(bind=True, name="yemenscan.tasks.stage3_vulnerabilities",
+                 soft_time_limit=1800, time_limit=2400)
+def celery_run_stage3(self, scan_id: str, scan_profile: str = "safe"):
+    """Executes stage 3 (Vulnerabilities) via Celery worker.
+    
+    Args:
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Drives timeouts,
+                      rate-limits, concurrency and DAST module selection.
+                      Note: deep profile overrides soft_time_limit/time_limit
+                      at dispatch time via apply_async(kwargs).
+    """
+    return run_stage3_pipeline(scan_id, scan_profile=scan_profile)
 
 
 @celery_app.task(bind=True, name="yemenscan.tasks.tool_in_session")
@@ -86,25 +95,41 @@ def celery_update_nuclei_templates(self):
 # Smart Dispatcher (Celery with graceful BackgroundTasks fallback)
 # ---------------------------------------------------------------------------
 
-def dispatch_scan_pipeline(domain: str, scan_id: str, background_tasks=None) -> str:
+def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", background_tasks=None) -> str:
     """
     Dispatches full scan to Celery worker if Redis is reachable;
     otherwise gracefully falls back to FastAPI BackgroundTasks or in-process.
+    Dynamically loads profile config to set Celery soft/hard time limits.
     Returns: 'celery' or 'background_tasks'
     """
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    if scan_profile not in _VALID_PROFILES:
+        scan_profile = "safe"
+
+    from core.security_scan_planner import SecurityScanPlanner
+    planner = SecurityScanPlanner()
+    profile_cfg = planner.get_profile_config(scan_profile)
+    soft_tl = profile_cfg.get("celery_soft_time_limit", 1800)
+    hard_tl = profile_cfg.get("celery_time_limit", 2400)
+
     if is_celery_broker_reachable():
         try:
-            celery_run_full_pipeline.apply_async(args=[domain, scan_id], ignore_result=True)
-            print(f"[+] Scan {scan_id} dispatched to Celery distributed worker queue via Redis.", flush=True)
+            celery_run_full_pipeline.apply_async(
+                args=[domain, scan_id, scan_profile],
+                soft_time_limit=soft_tl,
+                time_limit=hard_tl,
+                ignore_result=True
+            )
+            print(f"[+] Scan {scan_id} dispatched to Celery worker (profile={scan_profile}, soft_limit={soft_tl}s, hard_limit={hard_tl}s).", flush=True)
             return "celery"
         except Exception as ex:
             print(f"[!] Warning: Celery dispatch failed ({ex}), falling back to background tasks.", flush=True)
 
     # Fallback to local background tasks
     if background_tasks:
-        background_tasks.add_task(_execute_full_scan_fallback, domain, scan_id)
+        background_tasks.add_task(_execute_full_scan_fallback, domain, scan_id, scan_profile)
     else:
-        _execute_full_scan_fallback(domain, scan_id)
+        _execute_full_scan_fallback(domain, scan_id, scan_profile)
     return "background_tasks"
 
 
@@ -138,18 +163,41 @@ def dispatch_stage2(scan_id: str, background_tasks=None) -> str:
     return "background_tasks"
 
 
-def dispatch_stage3(scan_id: str, background_tasks=None) -> str:
+def dispatch_stage3(scan_id: str, scan_profile: str = "safe", background_tasks=None) -> str:
+    """Dispatches Stage 3 to Celery worker or BackgroundTasks fallback.
+    
+    Args:
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Passed to the
+                      pipeline and all tool calls. Deep profile extends
+                      Celery time limits automatically.
+    """
+    # Validate profile
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    if scan_profile not in _VALID_PROFILES:
+        scan_profile = "safe"
+
+    from core.security_scan_planner import SecurityScanPlanner
+    planner = SecurityScanPlanner()
+    profile_cfg = planner.get_profile_config(scan_profile)
+    soft_tl = profile_cfg.get("celery_soft_time_limit", 1800)
+    hard_tl = profile_cfg.get("celery_time_limit", 2400)
+
     if is_celery_broker_reachable():
         try:
-            celery_run_stage3.apply_async(args=[scan_id], ignore_result=True)
-            print(f"[+] Stage 3 for {scan_id} dispatched to Celery worker.", flush=True)
+            celery_run_stage3.apply_async(
+                args=[scan_id, scan_profile],
+                soft_time_limit=soft_tl,
+                time_limit=hard_tl,
+                ignore_result=True
+            )
+            print(f"[+] Stage 3 for {scan_id} dispatched to Celery worker (profile={scan_profile}, soft_limit={soft_tl}s, hard_limit={hard_tl}s).", flush=True)
             return "celery"
         except Exception:
             pass
     if background_tasks:
-        background_tasks.add_task(run_stage3_pipeline, scan_id)
+        background_tasks.add_task(run_stage3_pipeline, scan_id, scan_profile)
     else:
-        run_stage3_pipeline(scan_id)
+        run_stage3_pipeline(scan_id, scan_profile)
     return "background_tasks"
 
 
@@ -168,10 +216,10 @@ def dispatch_tool(scan_id: str, tool_name: str, options: Dict[str, Any], backgro
     return "background_tasks"
 
 
-def _execute_full_scan_fallback(domain: str, scan_id: str):
+def _execute_full_scan_fallback(domain: str, scan_id: str, scan_profile: str = "safe"):
     """In-process execution of full scan with DB ingestion."""
     try:
-        run_full_pipeline(domain, scan_id)
+        run_full_pipeline(domain, scan_id, scan_profile=scan_profile)
         try:
             with SessionLocal() as db:
                 ingest_scan_from_directory(db, scan_id, domain=domain)

@@ -603,6 +603,8 @@ def extract_origin_signals(
 
     # 1. Inspect httpx active_urls records
     for rec in active_urls_records:
+        if not isinstance(rec, dict):
+            continue
         rec_url = str(rec.get("url") or rec.get("input") or "").strip().rstrip("/")
         if not rec_url.startswith(norm_origin):
             continue
@@ -898,7 +900,11 @@ def generate_nuclei_scan_plan(
                 for line in f:
                     if line.strip():
                         try:
-                            active_records.append(json.loads(line.strip()))
+                            item = json.loads(line.strip())
+                            if isinstance(item, list):
+                                active_records.extend([x for x in item if isinstance(x, dict)])
+                            elif isinstance(item, dict):
+                                active_records.append(item)
                         except Exception:
                             pass
         except Exception:

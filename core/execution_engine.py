@@ -274,13 +274,21 @@ def run_stage2_pipeline(scan_id: str) -> Dict[str, Any]:
     }
 
 
-def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
+def run_stage3_pipeline(scan_id: str, scan_profile: str = "safe") -> Dict[str, Any]:
     """
     Executes Stage 3 (Vulnerability Assessment): Nuclei (CVE/OWASP) + Wapiti (DAST).
     Applies Scope Guard: third-party assets are excluded from full DAST
     but are still passed to Nuclei with the 'takeover' tag only.
     Unifies findings and updates database.
+
+    Args:
+        scan_profile: One of 'safe', 'dast_light', 'deep'. Drives timeouts,
+                      rate-limits, concurrency and DAST module selection.
     """
+    # Validate profile
+    _VALID_PROFILES = {"safe", "dast_light", "deep"}
+    if scan_profile not in _VALID_PROFILES:
+        scan_profile = "safe"
     session_dir = get_session_dir(scan_id)
     stat = get_status(scan_id) or {}
     target_domain = stat.get("target_domain", "unknown")
@@ -332,7 +340,10 @@ def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
             for t in filtered_targets:
                 fh.write(f"{t}\n")
         if filtered_targets:
-            ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+            try:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id, scan_profile=scan_profile)
+            except TypeError:
+                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
     else:
         print("[Scope Guard] ⚠️ لا توجد أصول داخلية — تخطي فحص Nuclei CVE.", flush=True)
 
@@ -353,7 +364,10 @@ def run_stage3_pipeline(scan_id: str) -> Dict[str, Any]:
     wapiti_findings: List[Dict[str, Any]] = []
 
     if in_scope_urls:
-        ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, in_scope_urls)
+        try:
+            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, in_scope_urls, profile=scan_profile)
+        except TypeError:
+            ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, in_scope_urls)
     else:
         print("[Scope Guard] ⚠️ لا توجد أصول داخلية — تخطي فحص Wapiti DAST.", flush=True)
 
@@ -628,17 +642,18 @@ def run_standalone_nuclei(
     }
 
 
-def run_standalone_wapiti(target_url: str, modules: Optional[str] = None) -> Dict[str, Any]:
+def run_standalone_wapiti(target_url: str, modules: Optional[str] = None, profile: str = "safe") -> Dict[str, Any]:
     """Runs Wapiti DAST independently against a target URL."""
     run_id = f"wapiti_{uuid.uuid4().hex[:8]}"
     work_dir = os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
-    ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()], modules=modules)
+    ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()], profile=profile, modules=modules)
     return {
         "tool": "wapiti",
         "status": "success" if ok else "failed",
         "target_url": target_url.strip(),
+        "profile": profile,
         "total_findings": len(findings),
         "findings": findings
     }
