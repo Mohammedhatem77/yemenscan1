@@ -2514,30 +2514,39 @@ def unify_and_save_vulnerabilities(
 
     # Smart Redirect-Aware Header Verification & Canonical Deduplication Triage
     combined_raw, suppressed_fps, canonicalized_count = filter_redirect_header_false_positives(combined_raw)
+
+    # Smart WAF Block Page False-Positive Suppression
+    from core.waf_false_positive_filter import filter_waf_block_false_positives
+    combined_raw, suppressed_waf_blocks = filter_waf_block_false_positives(combined_raw)
+
     triage_file = os.path.join(session_dir, "triage_suppressed.json")
-    if suppressed_fps or canonicalized_count > 0:
+    if suppressed_fps or canonicalized_count > 0 or suppressed_waf_blocks:
         unique_final_urls = sorted(list({item.get("final_url", "") for item in suppressed_fps if item.get("final_url")}))
         dest_hint = f" ({', '.join(unique_final_urls[:3])})" if unique_final_urls else ""
-        if suppressed_fps and canonicalized_count > 0:
-            triage_summary_ar = (
-                f"تم التحقق الشبكي المباشر واستبعاد {len(suppressed_fps)} تنبيهات آلية كاذبة (False Positives) "
-                f"ناتجة عن روابط إعادة التوجيه (301/308 Redirect) بعد التأكد من وجود ترويسات الحماية في الوجهة النهائية{dest_hint}، "
-                f"كما تم توحيد {canonicalized_count} ملاحظات مكررة عبر منافذ التحويل نحو المسار الرسمي."
+        summary_parts = []
+        if suppressed_fps:
+            summary_parts.append(
+                f"استبعاد {len(suppressed_fps)} تنبيهات آلية كاذبة (False Positives) ناتجة عن روابط إعادة التوجيه (301/308 Redirect) بعد التأكد من وجود ترويسات الحماية في الوجهة النهائية{dest_hint}"
             )
-        elif suppressed_fps:
-            triage_summary_ar = (
-                f"تم التحقق الشبكي المباشر واستبعاد {len(suppressed_fps)} تنبيهات آلية كاذبة (False Positives) "
-                f"ناتجة عن روابط إعادة التوجيه (301/308 Redirect) بعد التأكد من تفعيل ترويسات الحماية فعلياً في الوجهة النهائية{dest_hint}."
+        if canonicalized_count > 0:
+            summary_parts.append(
+                f"توحيد {canonicalized_count} ملاحظات مكررة عبر منافذ التحويل نحو المسار الرسمي"
             )
-        else:
-            triage_summary_ar = (
-                f"تم توحيد {canonicalized_count} ملاحظات ترويسات مكررة عبر منافذ إعادة التوجيه نحو الوجهة الرسمية الفعلية لمنع تضخم النتائج."
+        if suppressed_waf_blocks:
+            summary_parts.append(
+                f"استبعاد {len(suppressed_waf_blocks)} تنبيهات آلية كاذبة ناتجة عن صفحات حظر جدار الحماية (WAF Block Pages)"
             )
+
+        triage_summary_ar = "تم التحقق الشبكي المباشر و" + "، و".join(summary_parts) + "."
+
         triage_payload = {
-            "suppressed_count": len(suppressed_fps),
+            "suppressed_count": len(suppressed_fps) + len(suppressed_waf_blocks),
+            "redirect_suppressed_count": len(suppressed_fps),
+            "waf_block_suppressed_count": len(suppressed_waf_blocks),
             "canonicalized_count": canonicalized_count,
             "summary_ar": triage_summary_ar,
             "suppressed_items": suppressed_fps,
+            "waf_suppressed_items": suppressed_waf_blocks,
         }
         try:
             with open(triage_file, "w", encoding="utf-8") as tf:
