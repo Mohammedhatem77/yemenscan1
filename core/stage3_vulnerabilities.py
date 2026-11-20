@@ -1165,6 +1165,13 @@ def run_nuclei(
             }
             print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Nuclei: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}) عبر حاوية الفحص.", flush=True)
 
+    # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir, scan_profile=scan_profile)
+    nuclei_evasion_args = WAFEvasionEngine.build_nuclei_args(evasion_cfg)
+    if evasion_cfg.evasion_active:
+        print(f"[*] [WAF Evasion] تفعيل محرك التهرب من جدار الحماية في Nuclei ({len(evasion_cfg.spoofed_headers)} ترويسات موثوقة + تمويه المتصفح).", flush=True)
+
     all_stderr = []
     start_time = time.time()
     circuit_breaker_triggered = False
@@ -1260,6 +1267,8 @@ def run_nuclei(
             "-nc",
             "-silent"
         ]
+        if nuclei_evasion_args:
+            args.extend(nuclei_evasion_args)
 
         # Profile execution timeout: driven by matrix profile config
         p_timeout = max(
@@ -1900,6 +1909,15 @@ def run_wapiti_dast(
             }
             print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Wapiti DAST: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
 
+    # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir, scan_profile=profile)
+    wapiti_evasion_args = WAFEvasionEngine.build_wapiti_args(evasion_cfg)
+    if evasion_cfg.evasion_active:
+        print(f"[*] [WAF Evasion] تفعيل محرك التهرب من جدار الحماية في Wapiti ({len(evasion_cfg.spoofed_headers)} ترويسات موثوقة + تمويه المتصفح).", flush=True)
+        if evasion_cfg.wapiti_tasks:
+            _wapiti_tasks = evasion_cfg.wapiti_tasks
+
     for idx, target_orig in enumerate(targets_to_audit, start=1):
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} cancelled.")
@@ -1933,6 +1951,9 @@ def run_wapiti_dast(
             args.extend(["--verify-ssl", "1"])
         else:
             args.extend(["--verify-ssl", "0"])
+
+        if wapiti_evasion_args:
+            args.extend(wapiti_evasion_args)
 
         seeds = []
         for t_spec in wapiti_plan.get("targets", []):

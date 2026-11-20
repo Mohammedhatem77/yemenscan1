@@ -207,6 +207,12 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "-o", "/data/httpx_raw.jsonl"
     ]
 
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir)
+    httpx_evasion_args = WAFEvasionEngine.build_httpx_args(evasion_cfg)
+    if httpx_evasion_args:
+        args.extend(httpx_evasion_args)
+
     ok, output = run_docker_tool(
         image="projectdiscovery/httpx:v1.12.0",
         args=args,

@@ -65,6 +65,19 @@ def package_session_evidence_and_metadata(
                     unified_meta["waf_bypass"] = json.load(wf)
             except Exception:
                 pass
+
+        try:
+            from core.waf_evasion import WAFEvasionEngine
+            ev_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir)
+            unified_meta["waf_evasion"] = {
+                "evasion_active": ev_cfg.evasion_active,
+                "is_behind_waf": ev_cfg.is_behind_waf,
+                "spoofed_headers_count": len(ev_cfg.spoofed_headers) if ev_cfg.evasion_active else 0,
+                "user_agent_masked": ev_cfg.evasion_active,
+                "nuclei_delay": ev_cfg.nuclei_delay if ev_cfg.evasion_active else None
+            }
+        except Exception:
+            pass
         meta_path = os.path.join(session_dir, "scan_metadata.json")
         with open(meta_path, "w", encoding="utf-8") as out_m:
             json.dump(unified_meta, out_m, ensure_ascii=False, indent=2)
