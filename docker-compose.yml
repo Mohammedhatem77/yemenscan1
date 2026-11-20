@@ -48,6 +48,7 @@ services:
       - ./nuclei_runtime_templates:/app/nuclei_runtime_templates
       - ./nuclei_templates_official:/app/nuclei_templates_official
       - ./nuclei_update_status.json:/app/nuclei_update_status.json
+      - ./scan_capability_matrix.json:/app/scan_capability_matrix.json
       - ./templates:/app/templates
       - ./main.py:/app/main.py
       - ./database.py:/app/database.py
@@ -80,6 +81,7 @@ services:
       - ./nuclei_runtime_templates:/app/nuclei_runtime_templates
       - ./nuclei_templates_official:/app/nuclei_templates_official
       - ./nuclei_update_status.json:/app/nuclei_update_status.json
+      - ./scan_capability_matrix.json:/app/scan_capability_matrix.json
       - ./templates:/app/templates
       - ./main.py:/app/main.py
       - ./database.py:/app/database.py
