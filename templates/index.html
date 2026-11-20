@@ -1111,8 +1111,13 @@
         <!-- Scan Launch Card -->
         <div class="scan-card">
             <h2 style="font-size: 1.15rem; margin-bottom: 12px; color: #38bdf8;">بدء فحص استطلاعي وأمني شامل جديد</h2>
-            <div class="scan-form">
-                <input type="text" id="targetDomain" class="scan-input" placeholder="أدخل النطاق المستهدف (مثال: example.com أو hackthebox.com)" onkeydown="if(event.key==='Enter') startScan()">
+            <div class="scan-form" style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
+                <input type="text" id="targetDomain" class="scan-input" style="flex: 1; min-width: 250px;" placeholder="أدخل النطاق المستهدف (مثال: example.com أو testphp.vulnweb.com)" onkeydown="if(event.key==='Enter') startScan()">
+                <select id="scanProfileSelect" class="scan-input" style="min-width: 260px; font-weight: 600; cursor: pointer; background: #0f172a; color: #f8fafc; border-color: #334155;">
+                    <option value="safe" selected>🛡️ فحص آمن افتراضي (Safe - ترويسات وسلبي)</option>
+                    <option value="dast_light">⚡ فحص DAST خفيف (CSRF وإعادة التوجيه)</option>
+                    <option value="deep">🔥 فحص عميق متقدم (حقن SQLi/XSS وتجاوز WAF)</option>
+                </select>
                 <button id="startScanBtn" class="scan-btn" onclick="startScan()">
                     <span>🚀 إطلاق الفحص الأمني</span>
                 </button>
@@ -1123,7 +1128,8 @@
 
             <div id="progressBox" class="progress-box">
                 <div class="progress-header">
-                    <div style="display: flex; align-items: center; gap: 10px;">
+                    <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                        <span id="activeProfileBadge" style="display:none; padding: 3px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: bold;"></span>
                         <span id="currentStatusText">جاري تهيئة خط الفحص الأمني...</span>
                         <button id="progressStopBtn" class="stop-badge-btn" onclick="stopCurrentScan()" style="display: none;" title="إيقاف الفحص الجاري فوراً">🛑 إيقاف</button>
                     </div>
@@ -1814,11 +1820,35 @@
             document.getElementById('currentStatusText').style.color = '';
             document.getElementById('currentStatusText').textContent = 'جاري التحقق من النطاق وتهيئة خط الفحص الأمني...';
 
+            const profileSelect = document.getElementById('scanProfileSelect');
+            const scan_profile = profileSelect ? profileSelect.value : 'safe';
+
+            const profBadge = document.getElementById('activeProfileBadge');
+            if (profBadge) {
+                profBadge.style.display = 'inline-block';
+                if (scan_profile === 'deep') {
+                    profBadge.textContent = '🔥 فحص عميق (Deep Profile)';
+                    profBadge.style.color = '#ef4444';
+                    profBadge.style.background = 'rgba(239, 68, 68, 0.15)';
+                    profBadge.style.border = '1px solid rgba(239, 68, 68, 0.35)';
+                } else if (scan_profile === 'dast_light') {
+                    profBadge.textContent = '⚡ فحص DAST خفيف';
+                    profBadge.style.color = '#f59e0b';
+                    profBadge.style.background = 'rgba(245, 158, 11, 0.15)';
+                    profBadge.style.border = '1px solid rgba(245, 158, 11, 0.35)';
+                } else {
+                    profBadge.textContent = '🛡️ فحص آمن (Safe Profile)';
+                    profBadge.style.color = '#38bdf8';
+                    profBadge.style.background = 'rgba(56, 189, 248, 0.15)';
+                    profBadge.style.border = '1px solid rgba(56, 189, 248, 0.35)';
+                }
+            }
+
             try {
                 const res = await fetch(`${API_BASE}/api/scan/start`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ domain })
+                    body: JSON.stringify({ domain, scan_profile })
                 });
 
                 const data = await res.json();
@@ -1900,7 +1930,7 @@
                             }
                         } else if (wafInfo.is_behind_waf) {
                             wafStat.textContent = wafInfo.waf_provider || 'جدار حماية نشط';
-                            wafSub.textContent = 'محمي بجدار حماية سحابي';
+                            wafSub.textContent = 'محمي بـ WAF (تفعيل محرك التهرب والتخفي)';
                             if (wafCard) {
                                 wafCard.style.borderColor = 'rgba(245, 158, 11, 0.4)';
                                 wafCard.style.background = 'rgba(245, 158, 11, 0.05)';
@@ -2085,13 +2115,17 @@
                         const originBypassBadge = (v.bypassed_origin || v.waf_bypassed) 
                             ? `<span style="display:inline-block; margin-right:6px; font-size:0.75rem; font-family:monospace; color:#f87171; background:rgba(239,68,68,0.15); padding:1px 6px; border-radius:4px; border:1px solid rgba(239,68,68,0.4); font-weight:700;" title="تم كشف هذه الثغرة مباشرة عبر السيرفر الحقيقي وتجاوز WAF">⚡ تجاوز WAF (${v.origin_ip || 'سيرفر الأصل'})</span>` 
                             : '';
+                        const isInjection = ['sql_injection', 'cross_site_scripting', 'file_inclusion', 'server_side_request_forgery', 'crlf_injection', 'ldap_injection'].includes(v.coverage_family);
+                        const injectionBadge = isInjection
+                            ? `<span style="display:inline-block; margin-right:6px; font-size:0.75rem; color:#f59e0b; background:rgba(245,158,11,0.12); padding:1px 6px; border-radius:4px; border:1px solid rgba(245,158,11,0.3); font-weight:700;">💉 حقن DAST (${v.coverage_family})</span>`
+                            : '';
                         return `
                             <tr>
                                 <td><span class="badge ${sevClass}">${v.severity}</span></td>
                                 <td style="text-align: center;">${cvssBadge}</td>
                                 <td>
                                     <strong>${v.title}</strong>
-                                    ${cveBadge}${cweBadge}${originBypassBadge}
+                                    ${cveBadge}${cweBadge}${originBypassBadge}${injectionBadge}
                                     <div style="color:var(--text-muted); font-size:0.8rem; margin-top:4px;">${v.description}</div>
                                 </td>
                                 <td><span style="color:#818cf8;">${v.source}</span><br><small style="color:#38bdf8; font-weight:600;">🏷️ ${v.owasp_category || v.category}</small></td>
@@ -2358,7 +2392,13 @@
                 let url = target;
                 if (!url.startsWith('http')) url = 'http://' + url;
                 const mods = document.getElementById('standaloneModulesSelect') ? document.getElementById('standaloneModulesSelect').value : null;
-                payload = { target_url: url, modules: mods || null };
+                let prof = 'safe';
+                if (mods && (mods.includes('sql') || mods.includes('xss'))) {
+                    prof = 'deep';
+                } else if (mods && (mods.includes('csrf') || mods.includes('redirect'))) {
+                    prof = 'dast_light';
+                }
+                payload = { target_url: url, modules: mods || null, profile: prof };
             } else if (currentStandaloneTool === 'origin') {
                 let cleanDom = target.trim();
                 if (cleanDom.includes('://')) cleanDom = cleanDom.split('://')[1];
