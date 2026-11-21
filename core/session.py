@@ -129,8 +129,8 @@ def update_status(
             if is_completed is not None and not is_completed:
                 return
 
-        # 2. Failed protection: Once failed, late callbacks must never mark it completed
-        if current_val == "failed" and (status == "completed" or stage == "completed" or (is_completed and not has_error and error is None)):
+        # 2. Failed / Blocked protection: Once terminal failed or blocked, late callbacks must never mark it completed
+        if current_val in ("failed", "blocked_no_targets") and (status == "completed" or stage == "completed" or (is_completed and not has_error and error is None)):
             return
             
         status_dict["updated_at"] = datetime.now().isoformat()
@@ -151,8 +151,12 @@ def update_status(
             timestamp_str = datetime.now().strftime("%H:%M:%S")
             status_dict["logs"].append(f"[{timestamp_str}] {log_message}")
         if stats_update:
+            if "stats" not in status_dict or not isinstance(status_dict["stats"], dict):
+                status_dict["stats"] = {}
             for k, v in stats_update.items():
                 if k == "vuln_by_severity" and isinstance(v, dict):
+                    if "vuln_by_severity" not in status_dict["stats"] or not isinstance(status_dict["stats"]["vuln_by_severity"], dict):
+                        status_dict["stats"]["vuln_by_severity"] = {}
                     status_dict["stats"]["vuln_by_severity"].update(v)
                 else:
                     status_dict["stats"][k] = v

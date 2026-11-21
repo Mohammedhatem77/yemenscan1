@@ -251,6 +251,76 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         else:
             tool_statuses["httpx"] = "failed"
             
+        if ok_http:
+            phase_completed["phase2"] = True
+
+        # ── Pipeline Zero-Target Guard ────────────────────────────────
+        # If no open ports and no live web services were discovered on the target
+        if not open_ports and not active_urls:
+            print(f"[!] [Zero-Target Guard] لم يتم العثور على أي منافذ مفتوحة أو خدمات ويب نشطة للنطاق {domain}. إيقاف الفحص بأمان لمنع إعلان إكمال وهمي.", flush=True)
+            tool_statuses["kiterunner"] = "skipped"
+            tool_statuses["nuclei"] = "skipped"
+            tool_statuses["wapiti"] = "skipped"
+
+            unify_and_save_vulnerabilities(session_dir, scan_id, [], [])
+
+            final_status = "blocked_no_targets"
+            has_error = True
+            msg = "تنبيه: لم يتم اكتشاف أي منافذ مفتوحة أو خدمات ويب نشطة على الهدف (قد يكون الهدف محجوباً بواسطة جدار حماية أو غير متصل بالشبكة). تم إنهاء الفحص بأمان دون فحص ثغرات."
+
+            package_session_evidence_and_metadata(
+                session_dir=session_dir,
+                scan_id=scan_id,
+                domain=domain,
+                final_status=final_status,
+                tool_statuses=tool_statuses
+            )
+
+            update_status(
+                scan_id,
+                status=final_status,
+                stage=final_status,
+                progress=100,
+                is_completed=True,
+                has_error=has_error,
+                tool_status=tool_statuses,
+                log_message=msg
+            )
+            return
+
+        # If non-web open ports exist, but zero live web services (HTTP/HTTPS) were discovered
+        if open_ports and not active_urls:
+            print(f"[*] [Zero-Target Guard] تم اكتشاف {len(open_ports)} منفذ نشط ولكن لا توجد خدمات ويب. تخطي أدوات فحص الويب.", flush=True)
+            tool_statuses["kiterunner"] = "skipped"
+            tool_statuses["nuclei"] = "skipped"
+            tool_statuses["wapiti"] = "skipped"
+
+            unify_and_save_vulnerabilities(session_dir, scan_id, [], [])
+
+            final_status = "partial"
+            has_error = False
+            msg = f"اكتمل الفحص جزئياً: تم اكتشاف {len(open_ports)} منفذ نشط، ولكن لا توجد خدمات ويب (HTTP/HTTPS) لفحص ثغرات التطبيقات."
+
+            package_session_evidence_and_metadata(
+                session_dir=session_dir,
+                scan_id=scan_id,
+                domain=domain,
+                final_status=final_status,
+                tool_statuses=tool_statuses
+            )
+
+            update_status(
+                scan_id,
+                status=final_status,
+                stage=final_status,
+                progress=100,
+                is_completed=True,
+                has_error=has_error,
+                tool_status=tool_statuses,
+                log_message=msg
+            )
+            return
+
         if active_urls:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
@@ -262,9 +332,6 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         else:
             tool_statuses["kiterunner"] = "skipped"
             api_endpoints = []
-            
-        if ok_http:
-            phase_completed["phase2"] = True
         
         # -------------------------------------------------------------
         # Phase 3: Vulnerability Scanning
@@ -369,6 +436,10 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             final_status = "partial"
             has_error = True
             msg = f"اكتمل الفحص جزئياً: نجحت {len(success_tools)} أدوات وفشلت {len(failed_tools)} أدوات."
+        elif not open_ports and not active_urls:
+            final_status = "blocked_no_targets"
+            has_error = True
+            msg = "تنبيه: لم يتم اكتشاف أي منافذ مفتوحة أو خدمات ويب نشطة على الهدف (قد يكون الهدف محجوباً بواسطة جدار حماية أو غير متصل بالشبكة)."
         else:
             final_status = "completed"
             has_error = False

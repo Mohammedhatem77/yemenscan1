@@ -4,6 +4,7 @@ __pycache__/
 scans/
 *.log
 nuclei_templates_official/
+nuclei_runtime_templates/
 scratch/
 
 # Database files
