@@ -986,7 +986,8 @@ def run_kiterunner_or_api_probing(
         volume_dir=session_dir,
         timeout=exec_timeout,
         scan_id=scan_id,
-        extra_hosts=origin_extra_hosts
+        extra_hosts=origin_extra_hosts,
+        retries=1
     )
 
     if is_scan_cancelled(scan_id):

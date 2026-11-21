@@ -150,12 +150,13 @@ def run_docker_tool(
     container_mount: str = "/data",
     extra_volumes: Optional[List[Tuple[str, str]]] = None,
     scan_id: Optional[str] = None,
-    extra_hosts: Optional[Dict[str, str]] = None
+    extra_hosts: Optional[Dict[str, str]] = None,
+    retries: int = 0
 ) -> Tuple[bool, str]:
     """
     Executes a security tool inside a temporary Docker container mounting volume_dir to /data
     and any optional extra_volumes specified as (host_path, container_path).
-    Supports scan_id tracking for graceful cancellation and uses globally unique container names.
+    Supports scan_id tracking for graceful cancellation, retries for transient errors, and uses globally unique container names.
     """
     if scan_id and is_scan_cancelled(scan_id):
         raise ScanCancelledException(f"Scan {scan_id} has been cancelled by user.")
@@ -183,84 +184,105 @@ def run_docker_tool(
     if not is_docker_available():
         return False, "محرك Docker غير متاح أو لا يمتلك صلاحية تشغيل الحاويات المعزولة."
 
-    vol_path = get_docker_volume_path(volume_dir)
-    cmd = [get_docker_cmd(), "run", "--rm"]
-    
-    # Generate a unique container name with random hex suffix to prevent Docker name collisions
-    container_suffix = uuid.uuid4().hex[:6]
-    clean_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in scan_id) if scan_id else "tool"
-    container_name = f"ys_{clean_name}_{container_suffix}"
-    cmd.extend(["--name", container_name])
-        
-    cmd.extend(["-v", f"{vol_path}:{container_mount}"])
-    if extra_volumes:
-        for host_p, cont_p in extra_volumes:
-            cmd.extend(["-v", f"{get_docker_volume_path(host_p)}:{cont_p}"])
-    if extra_hosts:
-        for host_name, host_ip in extra_hosts.items():
-            if host_name and host_ip:
-                cmd.extend(["--add-host", f"{host_name}:{host_ip}"])
-    cmd.append(image)
-    cmd.extend(args)
-    
-    proc: Optional[subprocess.Popen] = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace"
-        )
-        if scan_id:
-            with _LOCK:
-                _ACTIVE_PROCS.setdefault(scan_id, set()).add(proc)
-                _ACTIVE_CONTAINERS.setdefault(scan_id, set()).add(container_name)
+    attempts = 1 + max(0, retries)
+    last_res: Tuple[bool, str] = (False, "Execution failed.")
 
-        stdout, stderr = proc.communicate(timeout=timeout)
-
+    for attempt in range(attempts):
         if scan_id and is_scan_cancelled(scan_id):
-            raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")
+            raise ScanCancelledException(f"Scan {scan_id} has been cancelled by user.")
 
-        if proc.returncode == 0:
-            return True, stdout
-        else:
-            return False, f"Process returned code {proc.returncode}: {stderr}"
-    except subprocess.TimeoutExpired as te:
-        if proc:
-            proc.kill()
+        vol_path = get_docker_volume_path(volume_dir)
+        cmd = [get_docker_cmd(), "run", "--rm"]
+        
+        # Generate a unique container name with random hex suffix to prevent Docker name collisions
+        container_suffix = uuid.uuid4().hex[:6]
+        clean_name = "".join(c if c.isalnum() or c in "_-" else "_" for c in scan_id) if scan_id else "tool"
+        container_name = f"ys_{clean_name}_{container_suffix}"
+        cmd.extend(["--name", container_name])
+            
+        cmd.extend(["-v", f"{vol_path}:{container_mount}"])
+        if extra_volumes:
+            for host_p, cont_p in extra_volumes:
+                cmd.extend(["-v", f"{get_docker_volume_path(host_p)}:{cont_p}"])
+        if extra_hosts:
+            for host_name, host_ip in extra_hosts.items():
+                if host_name and host_ip:
+                    cmd.extend(["--add-host", f"{host_name}:{host_ip}"])
+        cmd.append(image)
+        cmd.extend(args)
+        
+        proc: Optional[subprocess.Popen] = None
         try:
-            subprocess.run([get_docker_cmd(), "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        except Exception:
-            pass
-        partial_stdout = te.output or ""
-        if isinstance(partial_stdout, bytes):
-            partial_stdout = partial_stdout.decode("utf-8", errors="replace")
-        if partial_stdout and len(partial_stdout.strip()) > 0:
-            return True, partial_stdout
-        return False, f"Tool execution timed out after {timeout} seconds"
-    except ScanCancelledException:
-        if proc:
-            try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace"
+            )
+            if scan_id:
+                with _LOCK:
+                    _ACTIVE_PROCS.setdefault(scan_id, set()).add(proc)
+                    _ACTIVE_CONTAINERS.setdefault(scan_id, set()).add(container_name)
+
+            stdout, stderr = proc.communicate(timeout=timeout)
+
+            if scan_id and is_scan_cancelled(scan_id):
+                raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")
+
+            if proc.returncode == 0:
+                return True, stdout
+            else:
+                last_res = (False, f"Process returned code {proc.returncode}: {stderr}")
+                if attempt < attempts - 1 and not (scan_id and is_scan_cancelled(scan_id)):
+                    time.sleep(2)
+                    continue
+                return last_res
+        except subprocess.TimeoutExpired as te:
+            if proc:
                 proc.kill()
+            try:
+                subprocess.run([get_docker_cmd(), "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except Exception:
                 pass
-        try:
-            subprocess.run([get_docker_cmd(), "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-        except Exception:
-            pass
-        raise
-    except Exception as e:
-        return False, f"Exception while running {image}: {str(e)}"
-    finally:
-        if scan_id and proc:
-            with _LOCK:
-                if scan_id in _ACTIVE_PROCS:
-                    _ACTIVE_PROCS[scan_id].discard(proc)
-                if scan_id in _ACTIVE_CONTAINERS:
-                    _ACTIVE_CONTAINERS[scan_id].discard(container_name)
+            partial_stdout = te.output or ""
+            if isinstance(partial_stdout, bytes):
+                partial_stdout = partial_stdout.decode("utf-8", errors="replace")
+            if partial_stdout and len(partial_stdout.strip()) > 0:
+                return True, partial_stdout
+            last_res = (False, f"Tool execution timed out after {timeout} seconds")
+            if attempt < attempts - 1 and not (scan_id and is_scan_cancelled(scan_id)):
+                time.sleep(2)
+                continue
+            return last_res
+        except ScanCancelledException:
+            if proc:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            try:
+                subprocess.run([get_docker_cmd(), "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            last_res = (False, f"Exception while running {image}: {str(e)}")
+            if attempt < attempts - 1 and not (scan_id and is_scan_cancelled(scan_id)):
+                time.sleep(2)
+                continue
+            return last_res
+        finally:
+            if scan_id and proc:
+                with _LOCK:
+                    if scan_id in _ACTIVE_PROCS:
+                        _ACTIVE_PROCS[scan_id].discard(proc)
+                    if scan_id in _ACTIVE_CONTAINERS:
+                        _ACTIVE_CONTAINERS[scan_id].discard(container_name)
+
+    return last_res
 
 def run_local_tool(
     cmd: List[str],
