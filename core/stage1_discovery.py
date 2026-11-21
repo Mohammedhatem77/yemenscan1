@@ -127,6 +127,7 @@ def run_subfinder(domain: str, session_dir: str, scan_id: str) -> Tuple[bool, Li
         "-duc",
         "-timeout", "15",
         "-max-time", "5",
+        "-cs",
         "-json",
         "-o", "/data/subfinder_raw.jsonl"
     ]
@@ -189,6 +190,7 @@ def run_subfinder(domain: str, session_dir: str, scan_id: str) -> Tuple[bool, Li
     valid_subdomains: List[str] = []
     invalid_count = 0
     duplicate_count = 0
+    sources_summary: Dict[str, int] = {}
 
     for line in raw_lines:
         candidate_host = line
@@ -196,6 +198,12 @@ def run_subfinder(domain: str, session_dir: str, scan_id: str) -> Tuple[bool, Li
             try:
                 data = json.loads(line)
                 candidate_host = data.get("host") or line
+                srcs = data.get("sources")
+                if isinstance(srcs, list):
+                    for s in srcs:
+                        s_clean = str(s).strip().lower()
+                        if s_clean:
+                            sources_summary[s_clean] = sources_summary.get(s_clean, 0) + 1
             except Exception:
                 candidate_host = line
         norm = normalize_and_validate_subdomain(candidate_host, clean_domain)
@@ -228,7 +236,8 @@ def run_subfinder(domain: str, session_dir: str, scan_id: str) -> Tuple[bool, Li
         "raw_count": raw_count,
         "valid_count": valid_count,
         "invalid_count": invalid_count,
-        "duplicate_count": duplicate_count
+        "duplicate_count": duplicate_count,
+        "sources_summary": sources_summary
     }
     try:
         with open(meta_file, "w", encoding="utf-8") as f:
@@ -390,9 +399,10 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
         "-s", "c",
         "-duc",
         "-iv", "4",
-        "-timeout", "2s",
-        "-retries", "2",
-        "-rate", "300",
+        "-Pn",
+        "-timeout", "5s",
+        "-retries", "3",
+        "-rate", "100",
         "-verify",
         "-json",
         "-o", "/data/naabu_raw.jsonl"
@@ -543,6 +553,10 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
         "open_endpoint_count": open_endpoint_count,
         "unique_port_count": unique_port_count,
         "scanned_ports": SCANNED_PORTS,
+        "rate": 100,
+        "retries": 3,
+        "timeout": "5s",
+        "skip_host_discovery": True,
         "origin_ip": origin_ip,
         "origin_ports": [p for p in discovered_ports if origin_ip and p.startswith(f"{origin_ip}:")],
         "engine": "naabu",

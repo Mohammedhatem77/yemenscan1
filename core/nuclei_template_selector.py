@@ -610,7 +610,7 @@ def extract_origin_signals(
             continue
 
         # Tech field
-        for t in rec.get("tech", []):
+        for t in (rec.get("technologies") or rec.get("tech") or []):
             t_name, t_cat, t_ver = classify_technology(str(t))
             if t_ver:
                 _add_signal(t_name, t_cat, 120, f"httpx exact technology with version ({t})", t_ver)

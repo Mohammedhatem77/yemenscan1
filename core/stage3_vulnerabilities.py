@@ -98,6 +98,7 @@ NUCLEI_SAFE_FLAGS: List[str] = [
     "-ni",
     "-lna",
     "-iv", "4",
+    "-irr",
     "-rl", "10",
     "-c", "5",
     "-bs", "5",
@@ -994,6 +995,8 @@ def parse_nuclei_json_output(
                 "matcher_name": record.get("matcher-name") or record.get("matcher_name"),
                 "extracted_results": record.get("extracted-results") or record.get("extracted_results"),
                 "curl_command": record.get("curl-command") or record.get("curl_command"),
+                "request": record.get("request"),
+                "response": record.get("response"),
                 "description": description or f"تم اكتشاف مطابقة للقالب {template_id} على الهدف.",
                 "remediation": remediation or "مراجعة إعدادات الأمان وتطبيق التحديثات الموصى بها.",
                 "tags": tags_list,
@@ -1258,6 +1261,7 @@ def run_nuclei(
             "-ni",
             "-lna",
             "-iv", "4",
+            "-irr",
             "-rl", _nuclei_rate_limit,
             "-c", _nuclei_concurrency,
             "-bs", "5",
@@ -1557,6 +1561,7 @@ def run_standalone_nuclei(
             "-ni",
             "-lna",
             "-iv", "4",
+            "-irr",
             "-rl", str(rate_limit),
             "-c", str(concurrency),
             "-bs", str(concurrency),
@@ -1929,6 +1934,7 @@ def run_wapiti_dast(
 
         args = [
             "-u", target_orig,
+            "--scope", "domain",
             "-m", ",".join(enabled_modules),
             "-S", "paranoid",
             "--tasks", str(_wapiti_tasks),
@@ -1943,6 +1949,11 @@ def run_wapiti_dast(
             "--no-bugreport",
             "-t", str(_wapiti_timeout)
         ]
+
+        if profile == "deep":
+            args.extend(["-l", "2", "-dr", "2"])
+        else:
+            args.extend(["-l", "1", "-dr", "1"])
 
         if profile == "safe":
             args.append("--no-form-submission")

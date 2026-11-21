@@ -166,6 +166,23 @@ class WAFEvasionEngine:
         return args
 
     @staticmethod
+    def build_kiterunner_args(config: WAFEvasionConfig) -> List[str]:
+        """
+        Builds extra Kiterunner CLI flags for WAF evasion.
+        Returns empty list if evasion_active is False.
+        """
+        if not config.evasion_active:
+            return []
+
+        args: List[str] = []
+        if config.user_agent:
+            args.extend(["--user-agent", config.user_agent])
+        for h_name, h_val in config.spoofed_headers.items():
+            args.extend(["-H", f"{h_name}: {h_val}"])
+
+        return args
+
+    @staticmethod
     def obfuscate_sql_payload(payload: str) -> str:
         """
         Non-destructive SQL obfuscation using SQL comment inline substitution:

@@ -200,6 +200,10 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "-asn",
         "-cdn",
         "-duc",
+        "-favicon",
+        "-tls-grab",
+        "-method",
+        "-fr",
         "-timeout", "5",
         "-retries", "1",
         "-nf",
@@ -289,6 +293,10 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
                 "-location",
                 "-asn",
                 "-duc",
+                "-favicon",
+                "-tls-grab",
+                "-method",
+                "-fr",
                 "-timeout", "5",
                 "-retries", "1",
                 "-nf",
@@ -445,6 +453,15 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
 
         is_orig_target = bool(origin_ip and (host == origin_ip or str(data.get("input", "")).startswith(f"{origin_ip}:")))
 
+        favicon_val = data.get("favicon") or data.get("favicon_hash") or data.get("favicon_md5")
+        if favicon_val is not None:
+            favicon_val = str(favicon_val).strip()
+        favicon_url_val = data.get("favicon_url")
+        tls_val = data.get("tls")
+        method_val = data.get("method")
+        final_url_val = data.get("final_url")
+        chain_codes_val = data.get("chain_status_codes")
+
         web_targets.append({
             "url": norm_url,
             "input": data.get("input") or f"{host}:{port}",
@@ -455,12 +472,19 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             "title": data.get("title") or "",
             "webserver": data.get("webserver") or "",
             "tech": data.get("tech") or [],
+            "technologies": data.get("tech") or data.get("technologies") or [],
             "content_length": data.get("content_length"),
             "location": location_val,
             "cname": cname_list,
             "asn": asn_dict,
             "cdn": cdn_val,
             "cdn_name": cdn_name_val,
+            "favicon_hash": favicon_val,
+            "favicon_url": favicon_url_val,
+            "tls": tls_val,
+            "method": method_val,
+            "final_url": final_url_val,
+            "chain_status_codes": chain_codes_val,
             "is_origin": is_orig_target,
             "origin_ip": origin_ip if is_orig_target else None,
             "is_third_party": scope_info["is_third_party"],
@@ -503,6 +527,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "unique_host_count": len(unique_hosts),
         "scheme_counts": scheme_counts,
         "status_code_counts": status_code_counts,
+        "favicon_extracted_count": sum(1 for wt in web_targets if wt.get("favicon_hash")),
+        "tls_grabbed_count": sum(1 for wt in web_targets if wt.get("tls")),
         "origin_ip": origin_ip,
         "origin_live_services": [wt["url"] for wt in web_targets if wt.get("is_origin")],
         "engine": "httpx",
@@ -930,6 +956,12 @@ def run_kiterunner_or_api_probing(
         "-o", "json",
         "-q"
     ]
+
+    from core.waf_evasion import WAFEvasionEngine
+    evasion_cfg = WAFEvasionEngine.resolve_evasion_config(session_dir)
+    kr_evasion_args = WAFEvasionEngine.build_kiterunner_args(evasion_cfg)
+    if kr_evasion_args:
+        args.extend(kr_evasion_args)
 
     # Calculate realistic timeout based on target count (min 300s, max 1200s)
     exec_timeout = max(300, min(1200, len(targets_for_scan) * 60))
