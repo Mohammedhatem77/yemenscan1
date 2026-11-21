@@ -91,6 +91,39 @@ class TestEnhancedToolFlags(unittest.TestCase):
         self.assertIn("-rate", args)
         self.assertEqual(args[args.index("-rate") + 1], "100")
 
+    @patch("core.stage1_discovery.run_docker_tool")
+    @patch("core.stage1_discovery.update_status")
+    def test_naabu_deep_profile_scans_top_1000_ports(self, mock_update, mock_docker):
+        """2b. Verify Naabu in 'deep' profile scans Top 1000 ports (-tp 1000) with rate 150."""
+        raw_file = os.path.join(self.session_dir, "naabu_raw.jsonl")
+
+        def fake_docker(*args, **kwargs):
+            with open(raw_file, "w", encoding="utf-8") as f:
+                f.write('{"host":"example.com","port":8088,"protocol":"tcp"}\n')
+            return True, ""
+
+        mock_docker.side_effect = fake_docker
+
+        ok, ports = run_naabu(["example.com"], self.session_dir, self.scan_id, scan_profile="deep")
+        self.assertTrue(ok)
+        self.assertEqual(ports, ["example.com:8088"])
+
+        call_kwargs = mock_docker.call_args[1] if mock_docker.call_args[1] else {}
+        args = call_kwargs.get("args") or mock_docker.call_args[0][1]
+
+        self.assertIn("-tp", args)
+        self.assertEqual(args[args.index("-tp") + 1], "1000")
+        self.assertIn("-rate", args)
+        self.assertEqual(args[args.index("-rate") + 1], "150")
+
+        # Verify metadata
+        meta_file = os.path.join(self.session_dir, "naabu_metadata.json")
+        self.assertTrue(os.path.exists(meta_file))
+        with open(meta_file, "r", encoding="utf-8") as mf:
+            meta = json.load(mf)
+        self.assertEqual(meta.get("scan_profile"), "deep")
+        self.assertEqual(meta.get("scanned_ports_mode"), "top-1000")
+
     @patch("core.stage2_web_probing.run_docker_tool")
     @patch("core.stage2_web_probing.update_status")
     def test_httpx_enhanced_flags_and_evidence_extraction(self, mock_update, mock_docker):

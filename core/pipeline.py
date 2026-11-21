@@ -225,7 +225,10 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-        ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id)
+        try:
+            ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id, scan_profile=scan_profile)
+        except TypeError:
+            ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id)
         if ok_ports:
             tool_statuses["naabu"] = "success" if open_ports else "empty"
         else:

@@ -298,19 +298,32 @@ def _resolve_host_entry(clean_s: str) -> Tuple[str, str]:
     except Exception:
         return clean_s, ""
 
-def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bool, List[str]]:
+def run_naabu(
+    subdomains: List[str],
+    session_dir: str,
+    scan_id: str,
+    scan_profile: str = "safe"
+) -> Tuple[bool, List[str]]:
     """
     Runs Naabu to discover open ports across enumerated targets.
     Reads current execution targets without reusing stale targets files or injecting synthetic DNS mappings.
+    In 'deep' profile, scans the Top 1000 ports according to Nmap/SANS statistics (-tp 1000).
+    In 'safe' / default profile, scans curated web & non-standard service ports (or sensitive ports if origin IP is known).
     Outputs: naabu_raw.jsonl (evidence), ports.txt (validated host:port), and naabu_metadata.json.
     """
-    print("[2/4] جاري فحص المنافذ المفتوحة (Naabu Engine)...", flush=True)
+    is_deep = str(scan_profile or "").strip().lower() == "deep"
+    naabu_start_log = (
+        "بدء فحص المنافذ الموسعة (Top 1000 Ports) في الفحص العميق (Naabu)..."
+        if is_deep else
+        "بدء فحص المنافذ المفتوحة القياسية وغير القياسية (Naabu)..."
+    )
+    print(f"[2/4] جاري فحص المنافذ المفتوحة ({'Top 1000 Ports' if is_deep else 'Naabu Engine'})...", flush=True)
     update_status(
         scan_id,
         stage="phase1_discovery",
         tool="naabu",
         progress=25,
-        log_message="بدء فحص المنافذ المفتوحة القياسية وغير القياسية (Naabu)...",
+        log_message=naabu_start_log,
         stats_update={"open_ports_count": 0}
     )
 
@@ -388,21 +401,32 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
         )
         return True, []
 
-    # Calculate timeout based on target volume (min 240 seconds)
-    calc_timeout = max(240, len(valid_targets) * 5)
-    scanned_ports_arg = ORIGIN_SENSITIVE_PORTS if origin_ip else NAABU_PORTS
+    # Configure ports, rate limits, and timeouts based on scan profile
+    if is_deep:
+        port_flags = ["-tp", "1000"]
+        calc_timeout = max(360, len(valid_targets) * 15)
+        rate_val = "150"
+        scanned_mode = "top-1000"
+        scanned_ports_meta = "top-1000"
+    else:
+        scanned_ports_arg = ORIGIN_SENSITIVE_PORTS if origin_ip else NAABU_PORTS
+        port_flags = ["-p", scanned_ports_arg]
+        calc_timeout = max(240, len(valid_targets) * 5)
+        rate_val = "100"
+        scanned_mode = "origin-sensitive-44" if origin_ip else "curated-34"
+        scanned_ports_meta = SCANNED_PORTS
 
     args = [
         "-list", "/data/naabu_targets.txt",
-        "-silent",
-        "-p", scanned_ports_arg,
+        "-silent"
+    ] + port_flags + [
         "-s", "c",
         "-duc",
         "-iv", "4",
         "-Pn",
         "-timeout", "5s",
         "-retries", "3",
-        "-rate", "100",
+        "-rate", rate_val,
         "-verify",
         "-json",
         "-o", "/data/naabu_raw.jsonl"
@@ -545,6 +569,8 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
     metadata = {
         "tool": "naabu",
         "status": "completed",
+        "scan_profile": "deep" if is_deep else "safe",
+        "scanned_ports_mode": scanned_mode,
         "input_count": len(valid_targets),
         "raw_count": raw_count,
         "valid_count": valid_count,
@@ -552,8 +578,8 @@ def run_naabu(subdomains: List[str], session_dir: str, scan_id: str) -> Tuple[bo
         "duplicate_count": duplicate_count,
         "open_endpoint_count": open_endpoint_count,
         "unique_port_count": unique_port_count,
-        "scanned_ports": SCANNED_PORTS,
-        "rate": 100,
+        "scanned_ports": scanned_ports_meta,
+        "rate": int(rate_val),
         "retries": 3,
         "timeout": "5s",
         "skip_host_discovery": True,
