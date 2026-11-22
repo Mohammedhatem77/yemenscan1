@@ -2,6 +2,7 @@ import os
 import time
 import json
 import shutil
+import inspect
 from typing import Dict, Any, List
 from core.session import get_session_dir, update_status
 from core.runner import is_scan_cancelled, ScanCancelledException
@@ -118,6 +119,25 @@ def package_session_evidence_and_metadata(
     except Exception as e:
         print(f"[-] ملاحظة: تعذر أرشفة الأدلة الخام والميتاداتا: {e}", flush=True)
 
+def _invoke_tool_with_profile(tool_func, *args, **kwargs):
+    """
+    Invokes tool_func passing profile kwargs only if the target callable supports them.
+    Protects against legacy test mocks or teammate signatures without swallowing internal TypeErrors.
+    """
+    target = getattr(tool_func, "side_effect", None)
+    if not callable(target):
+        target = tool_func
+    try:
+        sig = inspect.signature(target)
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            return tool_func(*args, **kwargs)
+        filtered = {k: v for k, v in kwargs.items() if k in params}
+        return tool_func(*args, **filtered)
+    except (ValueError, TypeError):
+        return tool_func(*args, **kwargs)
+
 def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> None:
     """
     Executes the end-to-end 3-phase Black-box attack surface management pipeline:
@@ -207,11 +227,6 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             tool_statuses["subfinder"] = "success" if subdomains else "empty"
         else:
             tool_statuses["subfinder"] = "failed"
-            
-        clean_domain = domain.strip().lower()
-        if "://" in clean_domain:
-            clean_domain = clean_domain.split("://", 1)[1]
-        clean_domain = clean_domain.split("/", 1)[0].split(":", 1)[0].rstrip(".")
 
         # Prepare Naabu targets: Root Domain + valid discovered subdomains (subdomains.txt is untouched)
         naabu_targets = [clean_domain] + [s for s in subdomains if s.lower() != clean_domain]
@@ -225,10 +240,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-        try:
-            ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id, scan_profile=scan_profile)
-        except TypeError:
-            ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id)
+        ok_ports, open_ports = _invoke_tool_with_profile(run_naabu, naabu_targets, session_dir, scan_id, scan_profile=scan_profile)
         if ok_ports:
             tool_statuses["naabu"] = "success" if open_ports else "empty"
         else:
@@ -381,10 +393,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         if in_scope_urls and all_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            try:
-                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id, scan_profile=scan_profile)
-            except TypeError:
-                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+            ok_nuc, nuclei_findings = _invoke_tool_with_profile(run_nuclei, session_dir, scan_id, scan_profile=scan_profile)
             if ok_nuc:
                 tool_statuses["nuclei"] = "success" if nuclei_findings else "empty"
             else:
@@ -409,10 +418,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         if dast_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            try:
-                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets, profile=scan_profile)
-            except TypeError:
-                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
+            ok_wap, wapiti_findings = _invoke_tool_with_profile(run_wapiti_dast, session_dir, scan_id, dast_targets, profile=scan_profile)
             if ok_wap:
                 tool_statuses["wapiti"] = "success" if wapiti_findings else "empty"
             else:
