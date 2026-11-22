@@ -832,6 +832,8 @@ def ingest_scan_from_directory(
         final_status = "stopped"
     elif stage == "failed" or status_val == "failed":
         final_status = "failed"
+    elif stage == "blocked_no_targets" or status_val == "blocked_no_targets":
+        final_status = "blocked_no_targets"
     elif stage == "partial" or status_val == "partial":
         final_status = "partial"
     elif status_data.get("is_completed") and not has_err:
@@ -841,7 +843,7 @@ def ingest_scan_from_directory(
     else:
         final_status = status_val or stage or "completed"
 
-    progress = status_data.get("progress", 100 if final_status in ("completed", "stopped") else 0)
+    progress = status_data.get("progress_percentage", status_data.get("progress", 100 if final_status in ("completed", "stopped", "blocked_no_targets", "partial") else 0))
     stats_summary = status_data.get("stats")
     execution_logs = status_data.get("logs")
 

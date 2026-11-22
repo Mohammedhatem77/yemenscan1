@@ -444,19 +444,17 @@ class TestNaabuStage(unittest.TestCase):
         self.assertIn("-duc", args)
         self.assertIn("-iv", args)
         self.assertEqual(args[args.index("-iv") + 1], "4")
+        self.assertIn("-Pn", args)
         self.assertIn("-timeout", args)
-        self.assertEqual(args[args.index("-timeout") + 1], "2s")
+        self.assertEqual(args[args.index("-timeout") + 1], "5s")
         self.assertIn("-retries", args)
-        self.assertEqual(args[args.index("-retries") + 1], "2")
+        self.assertEqual(args[args.index("-retries") + 1], "3")
         self.assertIn("-rate", args)
-        self.assertEqual(args[args.index("-rate") + 1], "300")
+        self.assertEqual(args[args.index("-rate") + 1], "100")
         self.assertIn("-verify", args)
         self.assertIn("-json", args)
         self.assertIn("-o", args)
         self.assertIn("/data/naabu_raw.jsonl", args)
-
-        # Deprecated flag must NOT be present
-        self.assertNotIn("-Pn", args)
 
     @patch("core.stage1_discovery.run_docker_tool")
     @patch("core.stage1_discovery.update_status")

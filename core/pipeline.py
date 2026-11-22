@@ -2,6 +2,7 @@ import os
 import time
 import json
 import shutil
+import inspect
 from typing import Dict, Any, List
 from core.session import get_session_dir, update_status
 from core.runner import is_scan_cancelled, ScanCancelledException
@@ -118,6 +119,25 @@ def package_session_evidence_and_metadata(
     except Exception as e:
         print(f"[-] ملاحظة: تعذر أرشفة الأدلة الخام والميتاداتا: {e}", flush=True)
 
+def _invoke_tool_with_profile(tool_func, *args, **kwargs):
+    """
+    Invokes tool_func passing profile kwargs only if the target callable supports them.
+    Protects against legacy test mocks or teammate signatures without swallowing internal TypeErrors.
+    """
+    target = getattr(tool_func, "side_effect", None)
+    if not callable(target):
+        target = tool_func
+    try:
+        sig = inspect.signature(target)
+        params = sig.parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if has_var_kw:
+            return tool_func(*args, **kwargs)
+        filtered = {k: v for k, v in kwargs.items() if k in params}
+        return tool_func(*args, **filtered)
+    except (ValueError, TypeError):
+        return tool_func(*args, **kwargs)
+
 def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> None:
     """
     Executes the end-to-end 3-phase Black-box attack surface management pipeline:
@@ -207,11 +227,6 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             tool_statuses["subfinder"] = "success" if subdomains else "empty"
         else:
             tool_statuses["subfinder"] = "failed"
-            
-        clean_domain = domain.strip().lower()
-        if "://" in clean_domain:
-            clean_domain = clean_domain.split("://", 1)[1]
-        clean_domain = clean_domain.split("/", 1)[0].split(":", 1)[0].rstrip(".")
 
         # Prepare Naabu targets: Root Domain + valid discovered subdomains (subdomains.txt is untouched)
         naabu_targets = [clean_domain] + [s for s in subdomains if s.lower() != clean_domain]
@@ -225,7 +240,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-        ok_ports, open_ports = run_naabu(naabu_targets, session_dir, scan_id)
+        ok_ports, open_ports = _invoke_tool_with_profile(run_naabu, naabu_targets, session_dir, scan_id, scan_profile=scan_profile)
         if ok_ports:
             tool_statuses["naabu"] = "success" if open_ports else "empty"
         else:
@@ -251,6 +266,76 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         else:
             tool_statuses["httpx"] = "failed"
             
+        if ok_http:
+            phase_completed["phase2"] = True
+
+        # ── Pipeline Zero-Target Guard ────────────────────────────────
+        # If no open ports and no live web services were discovered on the target
+        if not open_ports and not active_urls:
+            print(f"[!] [Zero-Target Guard] لم يتم العثور على أي منافذ مفتوحة أو خدمات ويب نشطة للنطاق {domain}. إيقاف الفحص بأمان لمنع إعلان إكمال وهمي.", flush=True)
+            tool_statuses["kiterunner"] = "skipped"
+            tool_statuses["nuclei"] = "skipped"
+            tool_statuses["wapiti"] = "skipped"
+
+            unify_and_save_vulnerabilities(session_dir, scan_id, [], [])
+
+            final_status = "blocked_no_targets"
+            has_error = True
+            msg = "تنبيه: لم يتم اكتشاف أي منافذ مفتوحة أو خدمات ويب نشطة على الهدف (قد يكون الهدف محجوباً بواسطة جدار حماية أو غير متصل بالشبكة). تم إنهاء الفحص بأمان دون فحص ثغرات."
+
+            package_session_evidence_and_metadata(
+                session_dir=session_dir,
+                scan_id=scan_id,
+                domain=domain,
+                final_status=final_status,
+                tool_statuses=tool_statuses
+            )
+
+            update_status(
+                scan_id,
+                status=final_status,
+                stage=final_status,
+                progress=100,
+                is_completed=True,
+                has_error=has_error,
+                tool_status=tool_statuses,
+                log_message=msg
+            )
+            return
+
+        # If non-web open ports exist, but zero live web services (HTTP/HTTPS) were discovered
+        if open_ports and not active_urls:
+            print(f"[*] [Zero-Target Guard] تم اكتشاف {len(open_ports)} منفذ نشط ولكن لا توجد خدمات ويب. تخطي أدوات فحص الويب.", flush=True)
+            tool_statuses["kiterunner"] = "skipped"
+            tool_statuses["nuclei"] = "skipped"
+            tool_statuses["wapiti"] = "skipped"
+
+            unify_and_save_vulnerabilities(session_dir, scan_id, [], [])
+
+            final_status = "partial"
+            has_error = False
+            msg = f"اكتمل الفحص جزئياً: تم اكتشاف {len(open_ports)} منفذ نشط، ولكن لا توجد خدمات ويب (HTTP/HTTPS) لفحص ثغرات التطبيقات."
+
+            package_session_evidence_and_metadata(
+                session_dir=session_dir,
+                scan_id=scan_id,
+                domain=domain,
+                final_status=final_status,
+                tool_statuses=tool_statuses
+            )
+
+            update_status(
+                scan_id,
+                status=final_status,
+                stage=final_status,
+                progress=100,
+                is_completed=True,
+                has_error=has_error,
+                tool_status=tool_statuses,
+                log_message=msg
+            )
+            return
+
         if active_urls:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
@@ -262,9 +347,6 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         else:
             tool_statuses["kiterunner"] = "skipped"
             api_endpoints = []
-            
-        if ok_http:
-            phase_completed["phase2"] = True
         
         # -------------------------------------------------------------
         # Phase 3: Vulnerability Scanning
@@ -311,10 +393,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         if in_scope_urls and all_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            try:
-                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id, scan_profile=scan_profile)
-            except TypeError:
-                ok_nuc, nuclei_findings = run_nuclei(session_dir, scan_id)
+            ok_nuc, nuclei_findings = _invoke_tool_with_profile(run_nuclei, session_dir, scan_id, scan_profile=scan_profile)
             if ok_nuc:
                 tool_statuses["nuclei"] = "success" if nuclei_findings else "empty"
             else:
@@ -339,10 +418,7 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
         if dast_targets:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
-            try:
-                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets, profile=scan_profile)
-            except TypeError:
-                ok_wap, wapiti_findings = run_wapiti_dast(session_dir, scan_id, dast_targets)
+            ok_wap, wapiti_findings = _invoke_tool_with_profile(run_wapiti_dast, session_dir, scan_id, dast_targets, profile=scan_profile)
             if ok_wap:
                 tool_statuses["wapiti"] = "success" if wapiti_findings else "empty"
             else:
@@ -369,6 +445,10 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe") -> 
             final_status = "partial"
             has_error = True
             msg = f"اكتمل الفحص جزئياً: نجحت {len(success_tools)} أدوات وفشلت {len(failed_tools)} أدوات."
+        elif not open_ports and not active_urls:
+            final_status = "blocked_no_targets"
+            has_error = True
+            msg = "تنبيه: لم يتم اكتشاف أي منافذ مفتوحة أو خدمات ويب نشطة على الهدف (قد يكون الهدف محجوباً بواسطة جدار حماية أو غير متصل بالشبكة)."
         else:
             final_status = "completed"
             has_error = False

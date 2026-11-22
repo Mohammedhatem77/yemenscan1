@@ -2,6 +2,7 @@ import os
 import re
 import json
 import yaml
+from urllib.parse import urlparse
 from typing import Dict, List, Set, Tuple, Any, Optional
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -33,6 +34,13 @@ TECH_TAXONOMY: Dict[str, str] = {
     "tomcat": "application",
     "solr": "application",
     "sonarqube": "application",
+    "roundcube": "application",
+    "rocketchat": "application",
+    "nextcloud": "application",
+    "keycloak": "application",
+    "zabbix": "application",
+    "rabbitmq": "application",
+    "webmin": "application",
 
     # CMS
     "drupal": "cms",
@@ -66,6 +74,7 @@ TECH_TAXONOMY: Dict[str, str] = {
     "microsoft-iis": "web_server",
     "litespeed": "web_server",
     "caddy": "web_server",
+    "traefik": "web_server",
 
     # API Framework
     "swagger": "api_framework",
@@ -119,6 +128,73 @@ ELIGIBLE_CATEGORIES: Set[str] = {
     "cms",
     "web_server",
     "api_framework"
+}
+
+# ==============================================================================
+# Favicon MurmurHash3 Signature Database (Cryptographic ASM Fingerprints)
+# ==============================================================================
+FAVICON_HASH_MAP: Dict[str, Tuple[str, str]] = {
+    # Spring Boot (Spring Framework / Actuator)
+    "116323821": ("springboot", "framework"),
+    # WordPress CMS
+    "-1444503438": ("wordpress", "application"),
+    # phpMyAdmin Database Administration
+    "-130889426": ("phpmyadmin", "application"),
+    # Jenkins CI/CD Automation Server
+    "-81586312": ("jenkins", "application"),
+    # Apache Tomcat Web Server / Manager
+    "-489020299": ("tomcat", "application"),
+    # Atlassian Jira Issue Tracker
+    "60152990": ("jira", "application"),
+    # Atlassian Confluence Workspace
+    "-1205713401": ("confluence", "application"),
+    # Drupal CMS
+    "-1255140619": ("drupal", "cms"),
+    # Magento eCommerce
+    "1437553182": ("magento", "cms"),
+    # Laravel PHP Framework
+    "493198032": ("laravel", "framework"),
+    # GitLab DevOps Platform
+    "-60500702": ("gitlab", "application"),
+    # Grafana Observability Dashboard
+    "138810757": ("grafana", "application"),
+    # Kibana Elastic Search Interface
+    "702081692": ("kibana", "application"),
+    "-105436322": ("kibana", "application"),
+    # cPanel Web Hosting Management
+    "-127886975": ("cpanel", "application"),
+    # Microsoft IIS Web Server
+    "-1580970921": ("iis", "web_server"),
+    # Django Python Framework
+    "107727181": ("django", "framework"),
+    # SonarQube Code Quality Platform
+    "1501895511": ("sonarqube", "application"),
+    # Apache Solr Search Platform
+    "2129848525": ("solr", "application"),
+    # Webmin System Administration
+    "-1808607248": ("webmin", "application"),
+    # Ghost CMS
+    "-1566896263": ("ghost", "cms"),
+    # Joomla CMS
+    "1374567228": ("joomla", "cms"),
+    # Apache HTTP Server
+    "2083955132": ("apache", "web_server"),
+    # NGINX Web Server
+    "1746205783": ("nginx", "web_server"),
+    # Roundcube Webmail
+    "-1097871148": ("roundcube", "application"),
+    # Rocket.Chat Communication Platform
+    "1769863894": ("rocketchat", "application"),
+    # Nextcloud Self-Hosted Productivity Platform
+    "-2057558656": ("nextcloud", "application"),
+    # Keycloak Identity & Access Management
+    "-305179312": ("keycloak", "application"),
+    # Zabbix Monitoring Platform
+    "-335242039": ("zabbix", "application"),
+    # RabbitMQ Message Broker Console
+    "999357577": ("rabbitmq", "application"),
+    # Traefik Cloud Native Proxy
+    "-1234062682": ("traefik", "web_server")
 }
 
 # ==============================================================================
@@ -606,11 +682,17 @@ def extract_origin_signals(
         if not isinstance(rec, dict):
             continue
         rec_url = str(rec.get("url") or rec.get("input") or "").strip().rstrip("/")
-        if not rec_url.startswith(norm_origin):
+        # Check URL or Origin match
+        rec_origin = rec_url
+        if "://" in rec_url:
+            p_rec = urlparse(rec_url)
+            rec_origin = f"{p_rec.scheme}://{p_rec.netloc}".rstrip("/")
+        
+        if not (rec_url.startswith(norm_origin) or rec_origin == norm_origin):
             continue
 
         # Tech field
-        for t in rec.get("tech", []):
+        for t in (rec.get("technologies") or rec.get("tech") or []):
             t_name, t_cat, t_ver = classify_technology(str(t))
             if t_ver:
                 _add_signal(t_name, t_cat, 120, f"httpx exact technology with version ({t})", t_ver)
@@ -630,6 +712,34 @@ def extract_origin_signals(
             if tech_key in title_low:
                 t_name, t_cat, _ = classify_technology(tech_key)
                 _add_signal(t_name, t_cat, 40, f"page title evidence ('{title}')")
+
+        # Favicon Hash Signature (Cryptographic Binary Recognition)
+        fav_hash_raw = rec.get("favicon_hash") or rec.get("favicon")
+        if fav_hash_raw is not None:
+            fav_str = str(fav_hash_raw).strip()
+            if fav_str in FAVICON_HASH_MAP:
+                fav_name, fav_cat = FAVICON_HASH_MAP[fav_str]
+                _add_signal(fav_name, fav_cat, 100, f"favicon murmurhash3 signature ({fav_str} -> {fav_name})")
+                if fav_name == "springboot":
+                    _add_signal("spring", "framework", 90, f"spring ecosystem derived from favicon hash ({fav_str})")
+                    _add_signal("spring-actuator", "api_framework", 80, f"actuator endpoints derived from springboot favicon ({fav_str})")
+
+        # TLS Certificate Forensics (Issuer & SANs)
+        tls_data = rec.get("tls")
+        if isinstance(tls_data, dict):
+            issuer_org = str(tls_data.get("issuer_org") or "").lower()
+            issuer_cn = str(tls_data.get("issuer_cn") or "").lower()
+            if "cloudflare" in issuer_org or "cloudflare" in issuer_cn:
+                _add_signal("cloudflare", "cdn", 40, f"TLS certificate issuer ({tls_data.get('issuer_org') or tls_data.get('issuer_cn')})")
+
+            subject_an = tls_data.get("subject_an") or []
+            if isinstance(subject_an, list):
+                for san in subject_an:
+                    san_low = str(san).lower().strip()
+                    for tech_key in ["grafana", "gitlab", "jenkins", "kibana", "jira", "confluence", "swagger", "solr", "zabbix", "keycloak", "rabbitmq"]:
+                        if san_low.startswith(f"{tech_key}.") or f".{tech_key}." in san_low:
+                            t_name, t_cat, _ = classify_technology(tech_key)
+                            _add_signal(t_name, t_cat, 60, f"TLS SAN domain indicator ('{san}')")
 
     # 2. Inspect Kiterunner API routes (Layer C Discovery Signals)
     route_signals: Dict[str, int] = {}

@@ -1,9 +1,9 @@
 # Multi-stage extraction of official ProjectDiscovery security binaries and Docker CLI
 FROM docker:cli AS docker_cli
-FROM projectdiscovery/subfinder:latest AS subfinder_bin
-FROM projectdiscovery/naabu:latest AS naabu_bin
-FROM projectdiscovery/httpx:latest AS httpx_bin
-FROM projectdiscovery/nuclei:latest AS nuclei_bin
+FROM projectdiscovery/subfinder:v2.17.0 AS subfinder_bin
+FROM projectdiscovery/naabu:v2.6.1 AS naabu_bin
+FROM projectdiscovery/httpx:v1.12.0 AS httpx_bin
+FROM projectdiscovery/nuclei:v3.11.1 AS nuclei_bin
 
 # Multi-stage builder for Assetnote Kiterunner v1.0.2-yemscan1
 FROM golang:1.19-alpine@sha256:0ec0646e208ea58e5d29e558e39f2e59fccf39b7bda306cb53bbaff91919eca5 AS kiterunner_builder

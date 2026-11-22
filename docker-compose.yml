@@ -13,6 +13,11 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data_v2:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yemenscan_user -d yemenscan_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -22,6 +27,11 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   web:
     build: .
@@ -48,6 +58,7 @@ services:
       - ./nuclei_runtime_templates:/app/nuclei_runtime_templates
       - ./nuclei_templates_official:/app/nuclei_templates_official
       - ./nuclei_update_status.json:/app/nuclei_update_status.json
+      - ./scan_capability_matrix.json:/app/scan_capability_matrix.json
       - ./templates:/app/templates
       - ./main.py:/app/main.py
       - ./database.py:/app/database.py
@@ -55,8 +66,10 @@ services:
       - ./init_db.py:/app/init_db.py
       - ./core:/app/core
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   worker:
     image: yemenscan1-web:latest
@@ -80,6 +93,7 @@ services:
       - ./nuclei_runtime_templates:/app/nuclei_runtime_templates
       - ./nuclei_templates_official:/app/nuclei_templates_official
       - ./nuclei_update_status.json:/app/nuclei_update_status.json
+      - ./scan_capability_matrix.json:/app/scan_capability_matrix.json
       - ./templates:/app/templates
       - ./main.py:/app/main.py
       - ./database.py:/app/database.py
@@ -87,8 +101,10 @@ services:
       - ./init_db.py:/app/init_db.py
       - ./core:/app/core
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   flower:
     image: yemenscan1-web:latest
@@ -107,7 +123,8 @@ services:
       - ./core:/app/core
       - ./scans:/app/scans
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
 volumes:
   postgres_data_v2:
