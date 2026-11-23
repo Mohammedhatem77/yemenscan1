@@ -41,15 +41,17 @@ if not logger.handlers:
 
 
 def create_target_and_session(
-    db: Session, domain: str, scan_id: str
+    db: Session, domain: str, scan_id: str, owner_id: Optional[int] = None
 ) -> Tuple[Targets, ScanSessions]:
     """
     Check if a target already exists by domain_name; create it if absent.
     Create a new record in ScanSessions with status 'running' and current start time.
+    Associates the target and session with the authenticated owner_id for Ownership Isolation.
 
     :param db: Active SQLAlchemy Session
     :param domain: Target domain name (e.g., example.com)
     :param scan_id: Unique scan identifier (e.g., scan_20260919_120000_abc123)
+    :param owner_id: Optional ID of the user creating the target and session
     :return: Tuple containing (Targets, ScanSessions)
     """
     try:
@@ -63,27 +65,31 @@ def create_target_and_session(
         # 1. Check or create Target
         target = db.query(Targets).filter(Targets.domain_name == clean_domain).first()
         if not target:
-            logger.info("Creating new Target record for domain: %s", clean_domain)
+            logger.info("Creating new Target record for domain: %s (owner_id=%s)", clean_domain, owner_id)
             target = Targets(
                 domain_name=clean_domain,
                 last_scanned_at=now_utc,
                 created_at=now_utc,
+                owner_id=owner_id,
             )
             db.add(target)
             db.flush()
         else:
             logger.info("Found existing Target id=%d for domain: %s", target.id, clean_domain)
             target.last_scanned_at = now_utc
+            if owner_id and not target.owner_id:
+                target.owner_id = owner_id
 
         # 2. Check or create ScanSession
         scan_session = (
             db.query(ScanSessions).filter(ScanSessions.scan_id == scan_id).first()
         )
         if not scan_session:
-            logger.info("Creating new ScanSession record: %s (Target ID: %d)", scan_id, target.id)
+            logger.info("Creating new ScanSession record: %s (Target ID: %d, owner_id=%s)", scan_id, target.id, owner_id)
             scan_session = ScanSessions(
                 scan_id=scan_id,
                 target_id=target.id,
+                owner_id=owner_id,
                 status="running",
                 current_stage="running",
                 progress=0,
@@ -93,6 +99,8 @@ def create_target_and_session(
             db.add(scan_session)
         else:
             logger.info("Updating existing ScanSession record: %s", scan_id)
+            if owner_id and not scan_session.owner_id:
+                scan_session.owner_id = owner_id
             scan_session.target_id = target.id
             scan_session.status = "running"
             scan_session.current_stage = "running"

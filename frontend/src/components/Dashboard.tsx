@@ -296,7 +296,7 @@ export const Dashboard: React.FC = () => {
   const [expandedVulnId, setExpandedVulnId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const pollingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ==========================================================================
   // Load Historical Scans on Mount

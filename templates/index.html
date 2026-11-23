@@ -1092,6 +1092,100 @@
         ⚠️ ملاحظة: تم فتح الصفحة كملف محلي. تم توجيه الاتصال تلقائياً إلى الخادم المحلي: <a href="http://127.0.0.1:8000" target="_blank" style="color: #fff; text-decoration: underline; margin-right: 8px;">http://127.0.0.1:8000</a> (انقر هنا لفتح الرابط المباشر للوحة التحكم)
     </div>
 
+    <!-- ===================================================================== -->
+    <!-- YemenScan Cyberpunk Authentication Barrier Overlay (Login / Register) -->
+    <!-- ===================================================================== -->
+    <div id="authOverlay" style="display: none; position: fixed; inset: 0; z-index: 999999; background: #0f172a; align-items: center; justify-content: center; padding: 1.5rem; overflow-y: auto;">
+        <!-- Cyber Background Glow -->
+        <div style="position: absolute; inset: 0; background-image: radial-gradient(#06b6d4 1px, transparent 1px); background-size: 24px 24px; opacity: 0.12; pointer-events: none;"></div>
+        <div style="position: absolute; top: 20%; left: 10%; width: 350px; height: 350px; background: rgba(6, 182, 212, 0.08); border-radius: 50%; filter: blur(80px); pointer-events: none;"></div>
+        <div style="position: absolute; bottom: 20%; right: 10%; width: 350px; height: 350px; background: rgba(16, 185, 129, 0.08); border-radius: 50%; filter: blur(80px); pointer-events: none;"></div>
+
+        <!-- Auth Card -->
+        <div style="position: relative; width: 100%; max-width: 440px; background: rgba(19, 27, 46, 0.95); border: 1px solid #233154; border-radius: 20px; box-shadow: 0 25px 60px rgba(0, 0, 0, 0.8), 0 0 30px rgba(6, 182, 212, 0.15); padding: 2.25rem; z-index: 10; backdrop-filter: blur(12px);">
+            <!-- Glowing top line -->
+            <div style="position: absolute; top: 0; left: 15%; right: 15%; height: 2px; background: linear-gradient(90deg, transparent, #06b6d4, transparent);"></div>
+
+            <!-- Brand Header -->
+            <div style="text-align: center; margin-bottom: 1.5rem;">
+                <div style="display: inline-flex; position: relative; margin-bottom: 0.75rem;">
+                    <div style="width: 64px; height: 64px; border-radius: 16px; background: linear-gradient(135deg, rgba(6, 182, 212, 0.2), rgba(16, 185, 129, 0.15)); border: 1px solid rgba(6, 182, 212, 0.5); display: flex; align-items: center; justify-content: center; font-size: 32px; box-shadow: 0 0 20px rgba(6, 182, 212, 0.3);">
+                        🛡️
+                    </div>
+                </div>
+                <h1 style="font-size: 1.6rem; font-weight: 900; letter-spacing: 1px; background: linear-gradient(90deg, #38bdf8, #34d399); -webkit-background-clip: text; -webkit-text-fill-color: transparent; margin: 0;">
+                    YEMENSCAN
+                </h1>
+                <p style="font-size: 0.8rem; color: #94a3b8; margin-top: 4px; font-family: monospace;">بوابة المصادقة والأمان السحابي (v2.0)</p>
+            </div>
+
+            <!-- Tabs: Login vs Register -->
+            <div style="display: grid; grid-template-columns: 1fr 1fr; background: #0a0f1d; padding: 4px; border-radius: 12px; margin-bottom: 1.5rem; border: 1px solid #233154;">
+                <button type="button" id="tabLoginBtn" onclick="switchAuthTab('login')" style="padding: 8px; font-size: 0.85rem; font-weight: bold; border-radius: 8px; border: 1px solid rgba(6, 182, 212, 0.4); background: rgba(6, 182, 212, 0.15); color: #06b6d4; cursor: pointer; transition: all 0.2s;">
+                    تسجيل الدخول
+                </button>
+                <button type="button" id="tabRegisterBtn" onclick="switchAuthTab('register')" style="padding: 8px; font-size: 0.85rem; font-weight: bold; border-radius: 8px; border: 1px solid transparent; background: transparent; color: #94a3b8; cursor: pointer; transition: all 0.2s;">
+                    حساب جديد
+                </button>
+            </div>
+
+            <!-- Error and Success Feedback Alerts -->
+            <div id="authAlertError" style="display: none; padding: 10px 14px; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); border-radius: 10px; color: #fca5a5; font-size: 0.8rem; margin-bottom: 1.25rem; line-height: 1.5;"></div>
+            <div id="authAlertSuccess" style="display: none; padding: 10px 14px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.4); border-radius: 10px; color: #6ee7b7; font-size: 0.8rem; margin-bottom: 1.25rem; line-height: 1.5;"></div>
+
+            <!-- Form -->
+            <form id="authForm" onsubmit="handleAuthSubmit(event)">
+                <!-- Identifier / Username -->
+                <div style="margin-bottom: 1rem;">
+                    <label id="authIdentifierLabel" style="display: block; font-size: 0.8rem; color: #cbd5e1; margin-bottom: 6px; font-family: monospace;">
+                        اسم المستخدم أو البريد الإلكتروني
+                    </label>
+                    <div style="position: relative;">
+                        <input type="text" id="authIdentifierInput" placeholder="admin أو user@yemenscan.ye" required style="width: 100%; background: #0a0f1d; border: 1px solid #233154; border-radius: 10px; padding: 10px 14px 10px 38px; color: #f8fafc; font-size: 0.9rem; font-family: monospace; outline: none; transition: border 0.2s;" onfocus="this.style.borderColor='#06b6d4'" onblur="this.style.borderColor='#233154'">
+                        <span style="position: absolute; left: 12px; top: 11px; font-size: 14px; color: #64748b;">👤</span>
+                    </div>
+                </div>
+
+                <!-- Email Input (Register only) -->
+                <div id="authEmailGroup" style="display: none; margin-bottom: 1rem;">
+                    <label style="display: block; font-size: 0.8rem; color: #cbd5e1; margin-bottom: 6px; font-family: monospace;">
+                        البريد الإلكتروني (Email)
+                    </label>
+                    <div style="position: relative;">
+                        <input type="email" id="authEmailInput" placeholder="analyst@domain.com" style="width: 100%; background: #0a0f1d; border: 1px solid #233154; border-radius: 10px; padding: 10px 14px 10px 38px; color: #f8fafc; font-size: 0.9rem; font-family: monospace; outline: none; transition: border 0.2s;" onfocus="this.style.borderColor='#06b6d4'" onblur="this.style.borderColor='#233154'">
+                        <span style="position: absolute; left: 12px; top: 11px; font-size: 14px; color: #64748b;">✉️</span>
+                    </div>
+                </div>
+
+                <!-- Password Input with Eye Toggle -->
+                <div style="margin-bottom: 1.5rem;">
+                    <label style="display: block; font-size: 0.8rem; color: #cbd5e1; margin-bottom: 6px; font-family: monospace;">
+                        كلمة المرور (Password)
+                    </label>
+                    <div style="position: relative;">
+                        <input type="password" id="authPasswordInput" placeholder="••••••••••••" required style="width: 100%; background: #0a0f1d; border: 1px solid #233154; border-radius: 10px; padding: 10px 42px 10px 38px; color: #f8fafc; font-size: 0.9rem; font-family: monospace; outline: none; transition: border 0.2s;" onfocus="this.style.borderColor='#06b6d4'" onblur="this.style.borderColor='#233154'">
+                        <span style="position: absolute; left: 12px; top: 11px; font-size: 14px; color: #64748b;">🔒</span>
+                        <button type="button" onclick="togglePasswordVisibility()" title="إظهار / إخفاء كلمة المرور" style="position: absolute; right: 12px; top: 10px; background: transparent; border: none; cursor: pointer; font-size: 15px; color: #94a3b8; padding: 0;">
+                            <span id="authEyeIcon">👁️</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Submit Button -->
+                <button type="submit" id="authSubmitBtn" style="width: 100%; padding: 12px; border-radius: 10px; font-size: 0.95rem; font-weight: bold; background: linear-gradient(90deg, #0284c7, #06b6d4); color: #fff; border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px; box-shadow: 0 4px 15px rgba(6, 182, 212, 0.4); transition: all 0.2s;">
+                    <span id="authBtnIcon">🔑</span>
+                    <span id="authBtnText">تسجيل الدخول للمنظومة</span>
+                </button>
+            </form>
+
+            <!-- Security Badges Footer -->
+            <div style="margin-top: 1.75rem; padding-top: 1rem; border-top: 1px solid #233154; display: flex; justify-content: space-between; align-items: center; font-size: 0.75rem; color: #64748b; font-family: monospace;">
+                <span>🛡️ Argon2id + HS256</span>
+                <span style="padding: 2px 8px; border-radius: 4px; background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3);">RBAC Isolated</span>
+            </div>
+        </div>
+    </div>
+
     <header>
         <div class="logo-box">
             <div class="logo-icon">🛡️</div>
@@ -1100,7 +1194,13 @@
                 <p>منظومة الفحص الأمني السحابي واكتشاف الأصول (مشروع تخرج)</p>
             </div>
         </div>
-        <div>
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <div id="userProfileBadge" style="display: none; align-items: center; gap: 8px; background: rgba(15, 23, 42, 0.7); border: 1px solid #233154; padding: 6px 14px; border-radius: 8px; font-size: 0.85rem;">
+                <span>👤</span>
+                <span id="headerUsername" style="font-weight: bold; color: #38bdf8;">admin</span>
+                <span id="headerRoleBadge" style="font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; background: rgba(16, 185, 129, 0.2); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.4);">admin</span>
+                <button onclick="logoutUser()" title="تسجيل الخروج" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.4); color: #ef4444; cursor: pointer; font-size: 0.8rem; padding: 3px 10px; border-radius: 6px; margin-right: 6px;">🚪 خروج</button>
+            </div>
             <select id="scansHistory" class="scan-input" style="min-width: 240px; padding: 8px 14px;" onchange="loadSelectedScan()">
                 <option value="">-- الجلسات السابقة --</option>
             </select>
@@ -1114,9 +1214,8 @@
             <div class="scan-form" style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
                 <input type="text" id="targetDomain" class="scan-input" style="flex: 1; min-width: 250px;" placeholder="أدخل النطاق المستهدف (مثال: example.com أو testphp.vulnweb.com)" onkeydown="if(event.key==='Enter') startScan()">
                 <select id="scanProfileSelect" class="scan-input" style="min-width: 260px; font-weight: 600; cursor: pointer; background: #0f172a; color: #f8fafc; border-color: #334155;">
-                    <option value="safe" selected>🛡️ فحص آمن افتراضي (Safe - ترويسات وسلبي)</option>
-                    <option value="dast_light">⚡ فحص DAST خفيف (CSRF وإعادة التوجيه)</option>
-                    <option value="deep">🔥 فحص عميق متقدم (حقن SQLi/XSS وتجاوز WAF)</option>
+                    <option value="safe" selected>🛡️ فحص عادي (استكشافي وسلبي - بدون DoS)</option>
+                    <option value="deep">🔥 فحص عميق (شامل ونشط - كشف الثغرات المتقدمة)</option>
                 </select>
                 <button id="startScanBtn" class="scan-btn" onclick="startScan()">
                     <span>🚀 إطلاق الفحص الأمني</span>
@@ -1834,13 +1933,8 @@
                     profBadge.style.color = '#ef4444';
                     profBadge.style.background = 'rgba(239, 68, 68, 0.15)';
                     profBadge.style.border = '1px solid rgba(239, 68, 68, 0.35)';
-                } else if (scan_profile === 'dast_light') {
-                    profBadge.textContent = '⚡ فحص DAST خفيف';
-                    profBadge.style.color = '#f59e0b';
-                    profBadge.style.background = 'rgba(245, 158, 11, 0.15)';
-                    profBadge.style.border = '1px solid rgba(245, 158, 11, 0.35)';
                 } else {
-                    profBadge.textContent = '🛡️ فحص آمن (Safe Profile)';
+                    profBadge.textContent = '🛡️ فحص عادي (Normal Profile)';
                     profBadge.style.color = '#38bdf8';
                     profBadge.style.background = 'rgba(56, 189, 248, 0.15)';
                     profBadge.style.border = '1px solid rgba(56, 189, 248, 0.35)';
@@ -2407,10 +2501,8 @@
                 if (!url.startsWith('http')) url = 'http://' + url;
                 const mods = document.getElementById('standaloneModulesSelect') ? document.getElementById('standaloneModulesSelect').value : null;
                 let prof = 'safe';
-                if (mods && (mods.includes('sql') || mods.includes('xss'))) {
+                if (mods && (mods.includes('sql') || mods.includes('xss') || mods.includes('csrf') || mods.includes('redirect'))) {
                     prof = 'deep';
-                } else if (mods && (mods.includes('csrf') || mods.includes('redirect'))) {
-                    prof = 'dast_light';
                 }
                 payload = { target_url: url, modules: mods || null, profile: prof };
             } else if (currentStandaloneTool === 'origin') {
@@ -3272,17 +3364,262 @@
             });
         }
 
-        window.onload = () => {
+        // ===========================================================================
+        // Authentication & RBAC Management (JWT & Session Verification)
+        // ===========================================================================
+        let currentAuthMode = 'login';
 
+        function switchAuthTab(mode) {
+            currentAuthMode = mode;
+            const tabLogin = document.getElementById('tabLoginBtn');
+            const tabRegister = document.getElementById('tabRegisterBtn');
+            const emailGroup = document.getElementById('authEmailGroup');
+            const identLabel = document.getElementById('authIdentifierLabel');
+            const identInput = document.getElementById('authIdentifierInput');
+            const btnText = document.getElementById('authBtnText');
+            const btnIcon = document.getElementById('authBtnIcon');
+            const alertError = document.getElementById('authAlertError');
+            const alertSuccess = document.getElementById('authAlertSuccess');
+            alertError.style.display = 'none';
+            alertSuccess.style.display = 'none';
+
+            if (mode === 'register') {
+                tabRegister.style.borderColor = 'rgba(16, 185, 129, 0.4)';
+                tabRegister.style.background = 'rgba(16, 185, 129, 0.15)';
+                tabRegister.style.color = '#10b981';
+
+                tabLogin.style.borderColor = 'transparent';
+                tabLogin.style.background = 'transparent';
+                tabLogin.style.color = '#94a3b8';
+
+                emailGroup.style.display = 'block';
+                identLabel.textContent = 'اسم المستخدم (Username)';
+                identInput.placeholder = 'مثال: sec_analyst';
+                btnText.textContent = 'إنشاء حساب جديد (دور: Analyst)';
+                btnIcon.textContent = '✅';
+            } else {
+                tabLogin.style.borderColor = 'rgba(6, 182, 212, 0.4)';
+                tabLogin.style.background = 'rgba(6, 182, 212, 0.15)';
+                tabLogin.style.color = '#06b6d4';
+
+                tabRegister.style.borderColor = 'transparent';
+                tabRegister.style.background = 'transparent';
+                tabRegister.style.color = '#94a3b8';
+
+                emailGroup.style.display = 'none';
+                identLabel.textContent = 'اسم المستخدم أو البريد الإلكتروني';
+                identInput.placeholder = 'admin أو user@yemenscan.ye';
+                btnText.textContent = 'تسجيل الدخول للمنظومة';
+                btnIcon.textContent = '🔑';
+            }
+        }
+
+        function togglePasswordVisibility() {
+            const input = document.getElementById('authPasswordInput');
+            const eye = document.getElementById('authEyeIcon');
+            if (input.type === 'password') {
+                input.type = 'text';
+                eye.textContent = '🙈';
+            } else {
+                input.type = 'password';
+                eye.textContent = '👁️';
+            }
+        }
+
+        function getAuthToken() {
+            return localStorage.getItem('yemenscan_access_token');
+        }
+
+        function logoutUser() {
+            localStorage.removeItem('yemenscan_access_token');
+            localStorage.removeItem('yemenscan_refresh_token');
+            localStorage.removeItem('yemenscan_user');
+            document.getElementById('userProfileBadge').style.display = 'none';
+            document.getElementById('authOverlay').style.display = 'flex';
+        }
+
+        async function verifyAuthSession() {
+            const token = getAuthToken();
+            if (!token) {
+                document.getElementById('authOverlay').style.display = 'flex';
+                return false;
+            }
+            try {
+                const res = await fetch('/api/auth/me', {
+                    headers: { 'Authorization': 'Bearer ' + token }
+                });
+                if (res.ok) {
+                    const user = await res.json();
+                    document.getElementById('authOverlay').style.display = 'none';
+                    document.getElementById('headerUsername').textContent = user.username;
+                    document.getElementById('headerRoleBadge').textContent = user.role;
+                    document.getElementById('userProfileBadge').style.display = 'flex';
+                    return true;
+                } else {
+                    logoutUser();
+                    return false;
+                }
+            } catch (err) {
+                document.getElementById('authOverlay').style.display = 'none';
+                return true;
+            }
+        }
+
+        async function handleAuthSubmit(e) {
+            e.preventDefault();
+            const alertError = document.getElementById('authAlertError');
+            const alertSuccess = document.getElementById('authAlertSuccess');
+            const btn = document.getElementById('authSubmitBtn');
+            const origText = document.getElementById('authBtnText').textContent;
+
+            alertError.style.display = 'none';
+            alertSuccess.style.display = 'none';
+
+            const ident = document.getElementById('authIdentifierInput').value.trim();
+            const pass = document.getElementById('authPasswordInput').value;
+
+            if (currentAuthMode === 'register') {
+                const email = document.getElementById('authEmailInput').value.trim();
+                if (!ident || !email || !pass) {
+                    alertError.textContent = 'يرجى ملء كافة الحقول المطلوبة';
+                    alertError.style.display = 'block';
+                    return;
+                }
+                if (pass.length < 8) {
+                    alertError.textContent = 'كلمة المرور يجب أن لا تقل عن 8 خانات';
+                    alertError.style.display = 'block';
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.style.opacity = '0.6';
+                document.getElementById('authBtnText').textContent = 'جاري إنشاء الحساب...';
+
+                try {
+                    const regRes = await fetch('/api/auth/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: ident, email: email, password: pass })
+                    });
+                    const regData = await regRes.json();
+                    if (!regRes.ok) {
+                        let errMsg = 'فشل إنشاء الحساب';
+                        if (regData.detail) {
+                            if (typeof regData.detail === 'string') errMsg = regData.detail;
+                            else if (Array.isArray(regData.detail)) errMsg = regData.detail.map(d => d.msg || d.message || JSON.stringify(d)).join(' - ');
+                        }
+                        throw new Error(errMsg);
+                    }
+
+                    // Auto login after register
+                    const loginRes = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username_or_email: ident, password: pass })
+                    });
+                    const loginData = await loginRes.json();
+                    if (!loginRes.ok) throw new Error('تم إنشاء الحساب ولكن تعذر تسجيل الدخول التلقائي');
+
+                    localStorage.setItem('yemenscan_access_token', loginData.access_token);
+                    localStorage.setItem('yemenscan_refresh_token', loginData.refresh_token);
+                    localStorage.setItem('yemenscan_user', JSON.stringify(loginData.user));
+
+                    document.getElementById('headerUsername').textContent = loginData.user.username;
+                    document.getElementById('headerRoleBadge').textContent = loginData.user.role;
+                    document.getElementById('userProfileBadge').style.display = 'flex';
+                    document.getElementById('authOverlay').style.display = 'none';
+
+                    loadScansHistory();
+                } catch (err) {
+                    alertError.textContent = err.message;
+                    alertError.style.display = 'block';
+                } finally {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    document.getElementById('authBtnText').textContent = origText;
+                }
+            } else {
+                // Login Mode
+                if (!ident || !pass) {
+                    alertError.textContent = 'يرجى إدخال اسم المستخدم وكلمة المرور';
+                    alertError.style.display = 'block';
+                    return;
+                }
+
+                btn.disabled = true;
+                btn.style.opacity = '0.6';
+                document.getElementById('authBtnText').textContent = 'جاري التحقق من الهوية...';
+
+                try {
+                    const loginRes = await fetch('/api/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username_or_email: ident, password: pass })
+                    });
+                    const loginData = await loginRes.json();
+                    if (!loginRes.ok) {
+                        let errMsg = 'اسم المستخدم أو كلمة المرور غير صحيحة';
+                        if (loginData.detail && typeof loginData.detail === 'string') {
+                            errMsg = loginData.detail === 'Invalid credentials' ? 'بيانات الاعتماد غير صحيحة (اسم المستخدم أو كلمة المرور خاطئة)' : loginData.detail;
+                        }
+                        throw new Error(errMsg);
+                    }
+
+                    localStorage.setItem('yemenscan_access_token', loginData.access_token);
+                    localStorage.setItem('yemenscan_refresh_token', loginData.refresh_token);
+                    localStorage.setItem('yemenscan_user', JSON.stringify(loginData.user));
+
+                    document.getElementById('headerUsername').textContent = loginData.user.username;
+                    document.getElementById('headerRoleBadge').textContent = loginData.user.role;
+                    document.getElementById('userProfileBadge').style.display = 'flex';
+                    document.getElementById('authOverlay').style.display = 'none';
+
+                    loadScansHistory();
+                } catch (err) {
+                    alertError.textContent = err.message;
+                    alertError.style.display = 'block';
+                } finally {
+                    btn.disabled = false;
+                    btn.style.opacity = '1';
+                    document.getElementById('authBtnText').textContent = origText;
+                }
+            }
+        }
+
+        // Global fetch interceptor to append JWT bearer token to all /api/ requests
+        const originalFetch = window.fetch;
+        window.fetch = async function(...args) {
+            let [resource, config] = args;
+            const token = getAuthToken();
+            if (token && typeof resource === 'string' && resource.includes('/api/') && !resource.includes('/api/auth/login') && !resource.includes('/api/auth/register')) {
+                config = config || {};
+                config.headers = config.headers || {};
+                if (config.headers instanceof Headers) {
+                    if (!config.headers.has('Authorization')) config.headers.set('Authorization', 'Bearer ' + token);
+                } else {
+                    if (!config.headers['Authorization']) config.headers['Authorization'] = 'Bearer ' + token;
+                }
+            }
+            const res = await originalFetch(resource, config);
+            if (res.status === 401 && typeof resource === 'string' && !resource.includes('/api/auth/')) {
+                logoutUser();
+            }
+            return res;
+        };
+
+        window.onload = async () => {
             if (window.location.protocol === 'file:') {
                 const b = document.getElementById('fileProtocolBanner');
                 if (b) b.style.display = 'block';
             }
-            loadScansHistory();
-            loadNucleiInfo();
-            checkToolsHealth();
-            loadTemplateLifecycleStatus();
-            selectStandaloneTool('nuclei');
+            const isAuth = await verifyAuthSession();
+            if (isAuth) {
+                loadScansHistory();
+                loadNucleiInfo();
+                checkToolsHealth();
+                loadTemplateLifecycleStatus();
+                selectStandaloneTool('nuclei');
+            }
         };
     </script>
 </body>

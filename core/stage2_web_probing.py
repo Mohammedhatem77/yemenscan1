@@ -574,6 +574,8 @@ def normalize_kiterunner_input(raw_url: str) -> Optional[Tuple[str, Tuple[str, s
     clean = raw_url.strip()
     if not clean:
         return None
+    if "://" not in clean:
+        clean = f"https://{clean}"
     try:
         p = urlsplit(clean)
         scheme = p.scheme.lower()
@@ -605,6 +607,8 @@ def normalize_endpoint_url(raw_url: str) -> Optional[Tuple[str, str, Tuple[str, 
     clean = raw_url.strip()
     if not clean:
         return None
+    if "://" not in clean:
+        clean = f"https://{clean}"
     try:
         p = urlsplit(clean)
         scheme = p.scheme.lower()

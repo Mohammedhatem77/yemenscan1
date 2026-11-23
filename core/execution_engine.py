@@ -597,7 +597,11 @@ def run_standalone_kiterunner(target_url: str) -> Dict[str, Any]:
     work_dir = os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
-    ok, api_endpoints = run_kiterunner_or_api_probing([target_url.strip()], work_dir, run_id)
+    cleaned = target_url.strip()
+    if "://" not in cleaned:
+        cleaned = f"https://{cleaned}"
+
+    ok, api_endpoints = run_kiterunner_or_api_probing([cleaned], work_dir, run_id)
 
     meta_file = os.path.join(work_dir, "kiterunner_metadata.json")
     meta = {}

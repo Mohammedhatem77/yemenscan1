@@ -227,7 +227,9 @@ def run_docker_tool(
                     _ACTIVE_PROCS.setdefault(scan_id, set()).add(proc)
                     _ACTIVE_CONTAINERS.setdefault(scan_id, set()).add(container_name)
 
-            stdout, stderr = proc.communicate(timeout=timeout)
+            disable_timeout = os.getenv("DISABLE_TOOL_TIMEOUT", "true").lower() in ("true", "1", "yes")
+            effective_timeout = None if (disable_timeout or timeout is None or (isinstance(timeout, (int, float)) and timeout <= 0)) else timeout
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
 
             if scan_id and is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")
@@ -242,15 +244,29 @@ def run_docker_tool(
                 return last_res
         except subprocess.TimeoutExpired as te:
             if proc:
-                proc.kill()
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             try:
                 subprocess.run([get_docker_cmd(), "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except Exception:
                 pass
-            partial_stdout = te.output or ""
+            partial_stdout = getattr(te, "stdout", None) or te.output or ""
             if isinstance(partial_stdout, bytes):
                 partial_stdout = partial_stdout.decode("utf-8", errors="replace")
-            if partial_stdout and len(partial_stdout.strip()) > 0:
+
+            # Check if volume directory produced valid output files before timeout
+            has_vol_evidence = False
+            try:
+                if volume_dir and os.path.exists(volume_dir):
+                    ev_files = [f for f in os.listdir(volume_dir) if f.endswith((".jsonl", ".txt", ".json")) and os.path.getsize(os.path.join(volume_dir, f)) > 0]
+                    if ev_files:
+                        has_vol_evidence = True
+            except Exception:
+                pass
+
+            if (partial_stdout and len(partial_stdout.strip()) > 0) or has_vol_evidence:
                 return True, partial_stdout
             last_res = (False, f"Tool execution timed out after {timeout} seconds")
             if attempt < attempts - 1 and not (scan_id and is_scan_cancelled(scan_id)):
@@ -310,7 +326,9 @@ def run_local_tool(
             with _LOCK:
                 _ACTIVE_PROCS.setdefault(scan_id, set()).add(proc)
 
-        stdout, stderr = proc.communicate(timeout=timeout)
+        disable_timeout = os.getenv("DISABLE_TOOL_TIMEOUT", "true").lower() in ("true", "1", "yes")
+        effective_timeout = None if (disable_timeout or timeout is None or (isinstance(timeout, (int, float)) and timeout <= 0)) else timeout
+        stdout, stderr = proc.communicate(timeout=effective_timeout)
 
         if scan_id and is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")

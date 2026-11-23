@@ -102,6 +102,10 @@ from core.execution_engine import (
 
 tags_metadata = [
     {
+        "name": "0. المصادقة وإدارة الصلاحيات (Authentication & RBAC)",
+        "description": "تسجيل الحسابات، تسجيل الدخول الآمن، استخراج التوكنات (JWT)، والتحقق من صلاحيات المستخدمين وعزل البيانات."
+    },
+    {
         "name": "1. خط الفحص المتسلسل ومراحله (Sequential Pipeline & Stages)",
         "description": "إدارة دورة حياة الفحص الشامل التلقائي، وتشغيل مراحله الثلاث، أو تشغيل أداة محددة داخل جلسة الفحص."
     },
@@ -114,6 +118,8 @@ tags_metadata = [
         "description": "تشغيل كل أداة أمنية من الأدوات الست بشكل منفصل على هدف مخصص لاختبار النتائج بشكل فوري."
     }
 ]
+
+from routers.auth import router as auth_router
 
 app = FastAPI(
     title="YemenScan - منظومة الفحص الأمني السحابي",
@@ -132,6 +138,9 @@ _allowed_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()
     "http://127.0.0.1:5555",
 ]
 
+# Register Authentication & RBAC Router
+app.include_router(auth_router, prefix="/api/auth")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
@@ -144,8 +153,15 @@ app.add_middleware(
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+FRONTEND_DIST = os.path.join(BASE_DIR, "frontend", "dist")
+FRONTEND_ASSETS = os.path.join(FRONTEND_DIST, "assets")
+
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(TEMPLATES_DIR, exist_ok=True)
+
+# Mount compiled React frontend assets if built
+if os.path.exists(FRONTEND_ASSETS):
+    app.mount("/assets", StaticFiles(directory=FRONTEND_ASSETS), name="frontend-assets")
 
 class ScanRequest(BaseModel):
     domain: Optional[str] = None
@@ -202,12 +218,21 @@ def sanitize_domain(v: str, check_dns: bool = True) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def read_dashboard():
-    """Serves the interactive YemenScan Security Dashboard."""
+    """Serves the interactive YemenScan Security Dashboard with Authentication."""
     index_file = os.path.join(TEMPLATES_DIR, "index.html")
     if os.path.exists(index_file):
         with open(index_file, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     return HTMLResponse("<h1>مرحباً بك في YemenScan</h1><p>جاري تجهيز لوحة التحكم...</p>")
+
+@app.get("/react", response_class=HTMLResponse)
+def read_react_dashboard():
+    """Serves the React Vite frontend if compiled."""
+    react_index = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.exists(react_index):
+        with open(react_index, "r", encoding="utf-8") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse("<h1>React Build Not Found</h1>")
 
 @app.on_event("startup")
 def on_startup():
