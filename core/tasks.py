@@ -31,17 +31,17 @@ logger = logging.getLogger("yemenscan.tasks")
 
 @celery_app.task(bind=True, name="yemenscan.tasks.full_scan_pipeline",
                  soft_time_limit=1800, time_limit=2400)
-def celery_run_full_pipeline(self, domain: str, scan_id: str, scan_profile: str = "safe"):
+def celery_run_full_pipeline(self, domain: str, scan_id: str, scan_profile: str = "safe", resume: bool = False):
     """Executes the full pipeline via Celery worker and ingests into DB."""
-    logger.info("[Celery Worker] Starting full scan for %s (Scan ID: %s, Profile: %s)", domain, scan_id, scan_profile)
+    logger.info("[Celery Worker] Starting full scan (resume=%s) for %s (Scan ID: %s, Profile: %s)", resume, domain, scan_id, scan_profile)
     try:
-        run_full_pipeline(domain, scan_id, scan_profile=scan_profile)
+        run_full_pipeline(domain, scan_id, scan_profile=scan_profile, resume=resume)
         try:
             with SessionLocal() as db:
                 ingest_scan_from_directory(db, scan_id, domain=domain)
         except Exception as db_err:
             logger.error("[Celery Worker] DB ingestion error for %s: %s", scan_id, db_err)
-        return {"status": "success", "scan_id": scan_id, "domain": domain, "scan_profile": scan_profile}
+        return {"status": "success", "scan_id": scan_id, "domain": domain, "scan_profile": scan_profile, "resume": resume}
     except Exception as e:
         logger.error("[Celery Worker] Error in full scan %s: %s", scan_id, e)
         try:
@@ -95,11 +95,12 @@ def celery_update_nuclei_templates(self):
 # Smart Dispatcher (Celery with graceful BackgroundTasks fallback)
 # ---------------------------------------------------------------------------
 
-def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", background_tasks=None) -> str:
+def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", background_tasks=None, resume: bool = False) -> str:
     """
     Dispatches full scan to Celery worker if Redis is reachable;
     otherwise gracefully falls back to FastAPI BackgroundTasks or in-process.
     Dynamically loads profile config to set Celery soft/hard time limits.
+    Supports atomic resumption (resume=True).
     Returns: 'celery' or 'background_tasks'
     """
     _VALID_PROFILES = {"safe", "dast_light", "deep"}
@@ -115,21 +116,21 @@ def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe"
     if is_celery_broker_reachable():
         try:
             celery_run_full_pipeline.apply_async(
-                args=[domain, scan_id, scan_profile],
+                args=[domain, scan_id, scan_profile, resume],
                 soft_time_limit=soft_tl,
                 time_limit=hard_tl,
                 ignore_result=True
             )
-            print(f"[+] Scan {scan_id} dispatched to Celery worker (profile={scan_profile}, soft_limit={soft_tl}s, hard_limit={hard_tl}s).", flush=True)
+            print(f"[+] Scan {scan_id} (resume={resume}) dispatched to Celery worker (profile={scan_profile}, soft_limit={soft_tl}s, hard_limit={hard_tl}s).", flush=True)
             return "celery"
         except Exception as ex:
             print(f"[!] Warning: Celery dispatch failed ({ex}), falling back to background tasks.", flush=True)
 
     # Fallback to local background tasks
     if background_tasks:
-        background_tasks.add_task(_execute_full_scan_fallback, domain, scan_id, scan_profile)
+        background_tasks.add_task(_execute_full_scan_fallback, domain, scan_id, scan_profile, resume)
     else:
-        _execute_full_scan_fallback(domain, scan_id, scan_profile)
+        _execute_full_scan_fallback(domain, scan_id, scan_profile, resume)
     return "background_tasks"
 
 
@@ -216,10 +217,10 @@ def dispatch_tool(scan_id: str, tool_name: str, options: Dict[str, Any], backgro
     return "background_tasks"
 
 
-def _execute_full_scan_fallback(domain: str, scan_id: str, scan_profile: str = "safe"):
+def _execute_full_scan_fallback(domain: str, scan_id: str, scan_profile: str = "safe", resume: bool = False):
     """In-process execution of full scan with DB ingestion."""
     try:
-        run_full_pipeline(domain, scan_id, scan_profile=scan_profile)
+        run_full_pipeline(domain, scan_id, scan_profile=scan_profile, resume=resume)
         try:
             with SessionLocal() as db:
                 ingest_scan_from_directory(db, scan_id, domain=domain)

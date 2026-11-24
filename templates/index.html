@@ -484,6 +484,36 @@
             box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
         }
 
+        .resume-btn {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+            border: 1px solid #34d399 !important;
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.35) !important;
+        }
+
+        .resume-btn:hover {
+            box-shadow: 0 6px 22px rgba(16, 185, 129, 0.6) !important;
+            background: linear-gradient(135deg, #059669 0%, #047857 100%) !important;
+        }
+
+        .resume-badge-btn {
+            background: rgba(16, 185, 129, 0.18);
+            border: 1px solid #10b981;
+            color: #6ee7b7;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-size: 0.78rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .resume-badge-btn:hover {
+            background: #10b981;
+            color: #ffffff;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+        }
+
+
         .type-toggle-btn {
             background: transparent;
             border: none;
@@ -1223,6 +1253,9 @@
                 <button id="stopScanBtn" class="scan-btn stop-btn" onclick="stopCurrentScan()" style="display: none;">
                     <span>🛑 إيقاف الفحص</span>
                 </button>
+                <button id="resumeScanBtn" class="scan-btn resume-btn" onclick="resumeCurrentScan()" style="display: none;">
+                    <span>▶️ إكمال الفحص</span>
+                </button>
             </div>
 
             <div id="progressBox" class="progress-box">
@@ -1231,6 +1264,7 @@
                         <span id="activeProfileBadge" style="display:none; padding: 3px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: bold;"></span>
                         <span id="currentStatusText">جاري تهيئة خط الفحص الأمني...</span>
                         <button id="progressStopBtn" class="stop-badge-btn" onclick="stopCurrentScan()" style="display: none;" title="إيقاف الفحص الجاري فوراً">🛑 إيقاف</button>
+                        <button id="progressResumeBtn" class="resume-badge-btn" onclick="resumeCurrentScan()" style="display: none;" title="استئناف الفحص من نقطة التوقف">▶️ إكمال الفحص</button>
                     </div>
                     <span id="progressPercentage">0%</span>
                 </div>
@@ -1786,6 +1820,21 @@
             if (triageBox) { triageBox.style.display = 'none'; triageBox.innerHTML = ''; }
             document.getElementById('vulnsTableBody').innerHTML = '<tr><td colspan="6" class="empty-state">جاري التحميل...</td></tr>';
             document.getElementById('logsBox').innerHTML = '<div>[SYSTEM] جاري تحميل بيانات الجلسة...</div>';
+            showResumeButton(false);
+        }
+
+        function showResumeButton(show) {
+            const resumeBtn = document.getElementById('resumeScanBtn');
+            const progressResumeBtn = document.getElementById('progressResumeBtn');
+            if (resumeBtn) {
+                resumeBtn.style.display = show ? 'inline-flex' : 'none';
+                resumeBtn.disabled = false;
+                resumeBtn.innerHTML = '<span>▶️ إكمال الفحص</span>';
+            }
+            if (progressResumeBtn) {
+                progressResumeBtn.style.display = show ? 'inline-block' : 'none';
+                progressResumeBtn.disabled = false;
+            }
         }
 
         function setScanRunningUI(isRunning) {
@@ -1808,6 +1857,7 @@
                     progressStopBtn.style.display = 'inline-block';
                     progressStopBtn.disabled = false;
                 }
+                showResumeButton(false);
                 if (targetInput) targetInput.disabled = true;
             } else {
                 if (startBtn) {
@@ -1824,6 +1874,53 @@
                     progressStopBtn.disabled = false;
                 }
                 if (targetInput) targetInput.disabled = false;
+            }
+        }
+
+        async function resumeCurrentScan() {
+            if (!currentScanId) {
+                alert('لا توجد عملية فحص محددة لإكمالها.');
+                return;
+            }
+
+            const resumeBtn = document.getElementById('resumeScanBtn');
+            const progressResumeBtn = document.getElementById('progressResumeBtn');
+            if (resumeBtn) {
+                resumeBtn.disabled = true;
+                resumeBtn.innerHTML = '<span>⏳ جاري استئناف الفحص...</span>';
+            }
+            if (progressResumeBtn) {
+                progressResumeBtn.disabled = true;
+                progressResumeBtn.textContent = '⏳ جاري الاستئناف...';
+            }
+
+            const statusText = document.getElementById('currentStatusText');
+            if (statusText) {
+                statusText.textContent = '▶️ جاري استئناف خط الفحص الأمني من نقطة التوقف...';
+                statusText.style.color = '#34d399';
+            }
+
+            try {
+                const res = await fetch(`${API_BASE}/api/scan/${currentScanId}/resume`, {
+                    method: 'POST'
+                });
+                const data = await res.json();
+                if (res.ok && (data.status === 'success' || data.status === 'already_running')) {
+                    showResumeButton(false);
+                    setScanRunningUI(true);
+                    if (pollTimer) clearInterval(pollTimer);
+                    pollTimer = setInterval(pollStatus, 3000);
+                    pollStatus();
+                    loadScansHistory();
+                } else {
+                    alert('تنبيه: ' + (data.message || data.detail || 'تعذر استئناف الفحص'));
+                    showResumeButton(true);
+                    setScanRunningUI(false);
+                }
+            } catch (err) {
+                alert('خطأ أثناء إرسال أمر الاستئناف: ' + err.message);
+                showResumeButton(true);
+                setScanRunningUI(false);
             }
         }
 
@@ -2070,7 +2167,13 @@
                         if (pollTimer) clearInterval(pollTimer);
                         setScanRunningUI(false);
                         fetchScanDetails();
+                        if (sVal === 'stopped' || d.current_stage === 'stopped') {
+                            showResumeButton(true);
+                        } else {
+                            showResumeButton(false);
+                        }
                     } else {
+                        showResumeButton(false);
                         setScanRunningUI(true);
                     }
                     return isRunning;

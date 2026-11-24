@@ -224,3 +224,47 @@ def stop_scan_session(scan_id: str) -> bool:
         log_message="🛑 تم إرسال أمر إيقاف عملية الفحص بواسطة المستخدم."
     )
     return True
+
+def resume_scan_session(scan_id: str) -> bool:
+    """
+    Safely resets a stopped or interrupted scan session to 'running' state,
+    clearing cancellation flags, resetting is_completed and has_error to False,
+    and enabling atomic resumption from the exact point of interruption.
+    """
+    from core.runner import clear_scan_cancelled
+    clear_scan_cancelled(scan_id)
+    session_dir = get_session_dir(scan_id)
+    status_file = os.path.join(session_dir, "status.json")
+    with _STATUS_LOCK:
+        if not os.path.exists(status_file):
+            return False
+        try:
+            with open(status_file, "r", encoding="utf-8") as f:
+                status_dict = json.load(f)
+        except Exception:
+            return False
+
+        status_dict["updated_at"] = datetime.now().isoformat()
+        status_dict["status"] = "running"
+        status_dict["is_completed"] = False
+        status_dict["has_error"] = False
+        status_dict["error_message"] = None
+        timestamp_str = datetime.now().strftime("%H:%M:%S")
+        if "logs" not in status_dict:
+            status_dict["logs"] = []
+        status_dict["logs"].append(f"[{timestamp_str}] ▶️ تم استئناف عملية الفحص من نقطة التوقف.")
+        
+        temp_file = os.path.join(session_dir, f"status_{uuid.uuid4().hex[:4]}.tmp")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(status_dict, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, status_file)
+            return True
+        except Exception:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except Exception:
+                    pass
+            return False
+

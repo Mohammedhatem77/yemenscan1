@@ -209,7 +209,25 @@ def run_docker_tool(
                 if host_name and host_ip:
                     cmd.extend(["--add-host", f"{host_name}:{host_ip}"])
         cmd.append(image)
-        cmd.extend(args)
+        
+        # Tool-specific CLI sanitization for isolated Docker containers
+        tool_args = list(args)
+        if "nuclei" in image.lower():
+            # Nuclei CLI flag sanitization: Nuclei v3 does not support -delay in scan mode (fails with exit code 2).
+            # If passed by evasion engine or configs, strip it from real Docker invocation.
+            sanitized_args = []
+            skip_val = False
+            for a in tool_args:
+                if skip_val:
+                    skip_val = False
+                    continue
+                if a in ("-delay", "--delay"):
+                    skip_val = True
+                    continue
+                sanitized_args.append(a)
+            tool_args = sanitized_args
+
+        cmd.extend(tool_args)
         
         proc: Optional[subprocess.Popen] = None
         try:
@@ -237,7 +255,10 @@ def run_docker_tool(
             if proc.returncode == 0:
                 return True, stdout
             else:
-                last_res = (False, f"Process returned code {proc.returncode}: {stderr}")
+                err_msg = (stderr or "").strip()
+                if not err_msg:
+                    err_msg = (stdout or "").strip()
+                last_res = (False, f"Process returned code {proc.returncode}: {err_msg}")
                 if attempt < attempts - 1 and not (scan_id and is_scan_cancelled(scan_id)):
                     time.sleep(2)
                     continue

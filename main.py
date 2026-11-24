@@ -32,7 +32,8 @@ from core.session import (
     create_scan_session,
     get_status,
     get_session_dir,
-    list_all_scans
+    list_all_scans,
+    resume_scan_session
 )
 from core.pipeline import run_full_pipeline
 from core.target_validator import validate_target_domain, TargetValidationError
@@ -460,6 +461,86 @@ def stop_scan_endpoint(scan_id: Optional[str] = None, db: Session = Depends(get_
         "scan_id": scan_id,
         "message": f"تم إيقاف عملية الفحص '{scan_id}' بنجاح."
     }
+
+
+@app.post("/api/scans/{scan_id}/resume", tags=["1. خط الفحص المتسلسل ومراحله (Sequential Pipeline & Stages)"])
+@app.post("/api/scan/{scan_id}/resume", include_in_schema=False)
+@app.post("/api/scan/resume", include_in_schema=False)
+def resume_scan_endpoint(
+    background_tasks: BackgroundTasks,
+    scan_id: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """
+    استئناف عملية فحص متوقفة أو مقاطعة من نقطة التوقف مباشرة دون إعادة تنفيذ الأدوات المكتملة مسبقاً.
+    """
+    if not scan_id:
+        all_scans = list_all_scans()
+        if all_scans:
+            # Prefer stopped or interrupted scans
+            stopped_scans = [s for s in all_scans if s.get("status") in ("stopped", "cancelled", "partial", "failed") or s.get("current_stage") == "stopped"]
+            if stopped_scans:
+                scan_id = stopped_scans[0]["scan_id"]
+            else:
+                scan_id = all_scans[0]["scan_id"]
+        else:
+            raise HTTPException(status_code=404, detail="لا توجد عمليات فحص مسجلة.")
+
+    status = get_status(scan_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="جلسة الفحص غير موجودة.")
+
+    current_status = status.get("status") or status.get("current_stage")
+    if current_status == "running":
+        return {
+            "status": "already_running",
+            "scan_id": scan_id,
+            "message": "عملية الفحص قيد التشغيل بالفعل."
+        }
+
+    target_domain = status.get("target_domain")
+    if not target_domain:
+        session_record = db.query(ScanSessions).filter(ScanSessions.scan_id == scan_id).first()
+        if session_record and session_record.target:
+            target_domain = session_record.target.domain
+        else:
+            raise HTTPException(status_code=400, detail="تعذر تحديد النطاق المستهدف لجلسة الفحص.")
+
+    # 1. Safely reset session status to running and clear cancellation
+    resume_scan_session(scan_id)
+
+    # 2. Update DB scan session status if present
+    try:
+        session_record = db.query(ScanSessions).filter(ScanSessions.scan_id == scan_id).first()
+        if session_record:
+            session_record.status = "running"
+            db.commit()
+    except Exception as e:
+        print(f"[!] Warning: failed to update DB session status on resume: {e}", flush=True)
+
+    # 3. Determine scan_profile from metadata if available
+    session_dir = get_session_dir(scan_id)
+    scan_profile = "safe"
+    unified_meta_path = os.path.join(session_dir, "scan_metadata.json")
+    if os.path.exists(unified_meta_path):
+        try:
+            with open(unified_meta_path, "r", encoding="utf-8") as mf:
+                mdata = json.load(mf)
+                if mdata.get("scan_profile"):
+                    scan_profile = mdata["scan_profile"]
+        except Exception:
+            pass
+
+    # 4. Dispatch scan pipeline with resume=True
+    dispatch_scan_pipeline(target_domain, scan_id, scan_profile=scan_profile, background_tasks=background_tasks, resume=True)
+
+    return {
+        "status": "success",
+        "scan_id": scan_id,
+        "target_domain": target_domain,
+        "message": f"تم استئناف عملية الفحص '{scan_id}' بنجاح من نقطة التوقف."
+    }
+
 
 
 @app.delete("/api/scans/{scan_id}", tags=["1. خط الفحص المتسلسل ومراحله (Sequential Pipeline & Stages)"])

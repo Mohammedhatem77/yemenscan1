@@ -1099,8 +1099,9 @@ def run_nuclei(
             json.dump(metadata, mf, ensure_ascii=False, indent=2)
         return False, []
 
-    # 1. Generate Adaptive Scan Plan
-    scan_plan = generate_nuclei_scan_plan(session_dir, origins=targets)
+    # 1. Generate Adaptive Scan Plan with comprehensive uncapped templates
+    is_uncapped = profile_cfg.get("uncapped_templates", True)
+    scan_plan = generate_nuclei_scan_plan(session_dir, origins=targets, uncapped=is_uncapped)
     profiles = scan_plan.get("profiles", [])
 
     if not profiles or scan_plan["summary"]["selected_template_count"] == 0:
@@ -1196,7 +1197,16 @@ def run_nuclei(
         # Fail-closed validation: verify that every selected template exists on disk in target_templates_dir
         for st in selected_templates:
             rel_p = st.get("relative_path") or st.get("source_path") or ""
+            rel_p = rel_p.lstrip("/\\").replace("/", os.sep).replace("\\", os.sep)
             local_tpl_file = os.path.join(target_templates_dir, rel_p)
+            if not os.path.exists(local_tpl_file):
+                official_file = os.path.join(NUCLEI_TEMPLATES_OFFICIAL_DIR, rel_p)
+                if os.path.exists(official_file):
+                    try:
+                        os.makedirs(os.path.dirname(local_tpl_file), exist_ok=True)
+                        shutil.copy2(official_file, local_tpl_file)
+                    except Exception:
+                        pass
             if not os.path.exists(local_tpl_file):
                 tid = st.get("template_id") or st.get("id") or "unknown"
                 err_msg = f"Runtime template missing: {tid} at {local_tpl_file}"
@@ -1274,11 +1284,11 @@ def run_nuclei(
         if nuclei_evasion_args:
             args.extend(nuclei_evasion_args)
 
-        # Profile execution timeout: driven by matrix profile config
+        # Profile execution timeout: driven by matrix profile config and uncapped safe execution
         p_timeout = max(
             profile_cfg.get("container_timeout_nuclei_min", 180),
             min(
-                profile_cfg.get("container_timeout_nuclei_max", 600),
+                profile_cfg.get("container_timeout_nuclei_max", 3600),
                 len(selected_templates) * profile_cfg.get("container_timeout_nuclei_per_template", 8)
             )
         )
@@ -1307,6 +1317,8 @@ def run_nuclei(
 
         # Append raw output lines to combined raw file
         profile_raw_path = os.path.join(session_dir, raw_filename)
+        if os.path.exists(profile_raw_path) and os.path.getsize(profile_raw_path) > 0:
+            any_profile_succeeded = True
         if os.path.exists(profile_raw_path):
             with open(profile_raw_path, "r", encoding="utf-8", errors="replace") as prf:
                 with open(combined_raw_path, "a", encoding="utf-8") as crf:

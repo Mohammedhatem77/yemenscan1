@@ -803,10 +803,12 @@ class AdaptiveTemplateSelector:
         tech_max: int = 50,
         discovery_max: int = 20,
         origin_template_budget: int = 80,
-        origin_request_budget: int = 500
+        origin_request_budget: int = 500,
+        uncapped: bool = False
     ) -> Dict[str, Any]:
         """
-        Builds the per-origin scan plan adhering to strict budgets and safety manifest.
+        Builds the per-origin scan plan adhering to strict budgets and safety manifest,
+        or uncapped mode for thorough scanning without template limits.
         """
         safe_manifest = self.manifest_mgr.build_or_load_manifest()
 
@@ -820,7 +822,7 @@ class AdaptiveTemplateSelector:
         # Layer A: Universal Safe Baseline
         # -------------------------------------------------------------
         for bp in UNIVERSAL_SAFE_BASELINE_PATHS:
-            if len(layer_a_selected) >= baseline_max:
+            if not uncapped and len(layer_a_selected) >= baseline_max:
                 break
             # Find template in safe manifest by matching relative path
             matched_item = None
@@ -872,9 +874,10 @@ class AdaptiveTemplateSelector:
                 if matches:
                     matching_for_tech.append(tpl)
 
-            # Limit per technology to prevent single technology overflow
-            for tpl in matching_for_tech[:tech_max]:
-                if len(layer_b_selected) >= tech_max:
+            # Limit per technology only if not uncapped
+            sub_tech_matches = matching_for_tech if uncapped else matching_for_tech[:tech_max]
+            for tpl in sub_tech_matches:
+                if not uncapped and len(layer_b_selected) >= tech_max:
                     break
                 tid = tpl["template_id"]
                 if tid not in seen_template_ids:
@@ -911,8 +914,9 @@ class AdaptiveTemplateSelector:
                 if matches:
                     matching_for_route.append(tpl)
 
-            for tpl in matching_for_route[:discovery_max]:
-                if len(layer_c_selected) >= discovery_max:
+            sub_route_matches = matching_for_route if uncapped else matching_for_route[:discovery_max]
+            for tpl in sub_route_matches:
+                if not uncapped and len(layer_c_selected) >= discovery_max:
                     break
                 tid = tpl["template_id"]
                 if tid not in seen_template_ids:
@@ -934,12 +938,8 @@ class AdaptiveTemplateSelector:
         total_discovered = len(all_selected)
 
         # -------------------------------------------------------------
-        # Enforce Per-Origin Request Budget (500) & Template Budget (80)
+        # Enforce Per-Origin Request Budget & Template Budget (if not uncapped)
         # -------------------------------------------------------------
-        # Prioritize candidates:
-        #   1. Layer A (baseline) always takes highest priority
-        #   2. Efficiency: relevance_score / request_cost
-        #   3. Tie-breaker: score desc, cost asc, template_id asc
         def _candidate_rank_key(item: Dict[str, Any]):
             is_baseline = 1 if item.get("layer") == "baseline" else 0
             cost = max(1, item.get("request_cost") or item.get("estimated_requests") or 1)
@@ -955,9 +955,8 @@ class AdaptiveTemplateSelector:
 
         for tpl in all_selected:
             cost = max(1, tpl.get("request_cost") or tpl.get("estimated_requests") or 1)
-            # Ensure template has explicit request_cost key
             tpl["request_cost"] = cost
-            if (current_reqs + cost <= origin_request_budget) and (len(trimmed) < origin_template_budget):
+            if uncapped or ((current_reqs + cost <= origin_request_budget) and (len(trimmed) < origin_template_budget)):
                 trimmed.append(tpl)
                 current_reqs += cost
             else:
@@ -988,11 +987,13 @@ def generate_nuclei_scan_plan(
     origins: List[str],
     active_urls_json: Optional[str] = None,
     api_endpoints_file: Optional[str] = None,
-    scan_wide_pair_budget: int = 3000
+    scan_wide_pair_budget: int = 3000,
+    uncapped: bool = False
 ) -> Dict[str, Any]:
     """
     Generates a complete, multi-profile Adaptive Nuclei Scan Plan.
     Groups origins with identical template sets into unified profiles.
+    When uncapped=True, selects all matching templates without artificial limits.
     """
     if active_urls_json is None:
         active_urls_json = os.path.join(session_dir, "active_urls.json")
@@ -1035,13 +1036,13 @@ def generate_nuclei_scan_plan(
 
     for orig in origins:
         sig = extract_origin_signals(orig, active_records, api_routes)
-        plan = selector.select_templates_for_origin(sig)
+        plan = selector.select_templates_for_origin(sig, uncapped=uncapped)
         origin_plans.append(plan)
         total_pairs += plan["total_selected"]
 
-    # 4. Check & enforce scan-wide budget (max 3000 pairs)
+    # 4. Check & enforce scan-wide budget (max 3000 pairs) only if not uncapped
     budget_limited = False
-    if total_pairs > scan_wide_pair_budget and origin_plans:
+    if not uncapped and total_pairs > scan_wide_pair_budget and origin_plans:
         budget_limited = True
         allowed_per_origin = max(1, scan_wide_pair_budget // len(origin_plans))
         for p in origin_plans:
@@ -1083,8 +1084,8 @@ def generate_nuclei_scan_plan(
                 "skipped_due_to_budget": sum(gp["skipped_due_to_budget"] for gp in grouped_plans)
             },
             "limits": {
-                "template_budget": 80,
-                "request_budget": 500,
+                "template_budget": "unlimited" if uncapped else 80,
+                "request_budget": "unlimited" if uncapped else 500,
                 "rate_limit": 10,
                 "concurrency": 5
             },
@@ -1114,9 +1115,10 @@ def generate_nuclei_scan_plan(
             "selected_template_count": total_selected,
             "skipped_due_to_template_budget": total_skipped,
             "estimated_request_count": total_est_reqs,
-            "request_budget": 500,
+            "request_budget": "unlimited" if uncapped else 500,
             "rate_limit": 10,
             "concurrency": 5,
+            "uncapped": uncapped,
             "budget_limited": budget_limited,
             "preventive_load_controls": True,
             "circuit_breaker_telemetry": "requires_upstream_proxy"

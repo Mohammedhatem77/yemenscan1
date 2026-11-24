@@ -215,13 +215,15 @@ class SecurityScanPlanner:
             except Exception:
                 pass
 
-        # 3. Generate Nuclei Plan (Adaptive, budgeted, safe runtime templates only)
+        # 3. Generate Nuclei Plan (Adaptive, comprehensive uncapped templates, safe runtime only)
+        is_uncapped = profile_cfg.get("uncapped_templates", True)
         nuclei_plan = generate_nuclei_scan_plan(
             session_dir=session_dir,
             origins=origins,
             active_urls_json=active_urls_json,
             api_endpoints_file=api_endpoints_file,
-            scan_wide_pair_budget=scan_wide_pair_budget
+            scan_wide_pair_budget=scan_wide_pair_budget,
+            uncapped=is_uncapped
         )
 
         # 4. Generate Wapiti Plan
