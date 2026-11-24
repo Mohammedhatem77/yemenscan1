@@ -357,11 +357,15 @@ def run_naabu(
         if waf_info.get("waf_bypassed") and waf_info.get("verified_origins"):
             origin_ip = waf_info["verified_origins"][0].get("origin_ip")
             if origin_ip:
-                norm_orig = normalize_target_host(origin_ip)
-                if norm_orig and norm_orig not in seen_targets:
-                    seen_targets.add(norm_orig)
-                    valid_targets.append(norm_orig)
-                    print(f"[+] [Naabu Adaptive] إضافة السيرفر الحقيقي ({norm_orig}) لفحص المنافذ الموسعة والحساسة.", flush=True)
+                from core.target_validator import is_safe_ip_address
+                if not is_safe_ip_address(origin_ip):
+                    print(f"[!] [Scope Guard] استبعاد عنوان السيرفر الحقيقي ({origin_ip}) لأنه عنوان غير آمن (خاص أو محلي أو ميتاداتا).", flush=True)
+                else:
+                    norm_orig = normalize_target_host(origin_ip)
+                    if norm_orig and norm_orig not in seen_targets:
+                        seen_targets.add(norm_orig)
+                        valid_targets.append(norm_orig)
+                        print(f"[+] [Naabu Adaptive] إضافة السيرفر الحقيقي ({norm_orig}) لفحص المنافذ الموسعة والحساسة.", flush=True)
     except Exception:
         pass
 

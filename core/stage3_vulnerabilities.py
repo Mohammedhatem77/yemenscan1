@@ -17,6 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from core.runner import run_docker_tool, run_local_tool, is_docker_available, is_scan_cancelled, ScanCancelledException
 from core.session import update_status
 from core.target_prioritizer import prioritize_urls, prioritize_hosts, prioritize_dict_records
+from core.target_validator import validate_redirect_hop, is_safe_host_or_ip
 from core.nuclei_template_selector import (
     generate_nuclei_scan_plan,
     SafeManifestManager,
@@ -1160,14 +1161,17 @@ def run_nuclei(
     waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
     origin_ip = None
     if waf_bypassed:
-        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
-        root_dom = waf_info.get("domain") or ""
-        if root_dom and origin_ip:
-            origin_extra_hosts = {
-                root_dom: origin_ip,
-                f"www.{root_dom}": origin_ip
-            }
-            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Nuclei: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}) عبر حاوية الفحص.", flush=True)
+        candidate_orig = waf_info["verified_origins"][0].get("origin_ip")
+        from core.target_validator import is_safe_ip_address
+        if candidate_orig and is_safe_ip_address(candidate_orig):
+            origin_ip = candidate_orig
+            root_dom = waf_info.get("domain") or ""
+            if root_dom and origin_ip:
+                origin_extra_hosts = {
+                    root_dom: origin_ip,
+                    f"www.{root_dom}": origin_ip
+                }
+                print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Nuclei: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}) عبر حاوية الفحص.", flush=True)
 
     # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
     from core.waf_evasion import WAFEvasionEngine
@@ -1917,14 +1921,17 @@ def run_wapiti_dast(
     waf_bypassed = bool(waf_info.get("waf_bypassed") and waf_info.get("verified_origins"))
     origin_ip = None
     if waf_bypassed:
-        origin_ip = waf_info["verified_origins"][0]["origin_ip"]
-        root_dom = waf_info.get("domain") or ""
-        if root_dom and origin_ip:
-            origin_extra_hosts = {
-                root_dom: origin_ip,
-                f"www.{root_dom}": origin_ip
-            }
-            print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Wapiti DAST: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
+        candidate_orig = waf_info["verified_origins"][0].get("origin_ip")
+        from core.target_validator import is_safe_ip_address
+        if candidate_orig and is_safe_ip_address(candidate_orig):
+            origin_ip = candidate_orig
+            root_dom = waf_info.get("domain") or ""
+            if root_dom and origin_ip:
+                origin_extra_hosts = {
+                    root_dom: origin_ip,
+                    f"www.{root_dom}": origin_ip
+                }
+                print(f"[*] تفعيل تجاوز WAF التلقائي في فحص Wapiti DAST: توجيه {root_dom} مباشرة إلى الأصل ({origin_ip}).", flush=True)
 
     # WAF Evasion Engine (Active when WAF is present without verified origin, or in deep profile)
     from core.waf_evasion import WAFEvasionEngine
@@ -2280,12 +2287,20 @@ def _inspect_redirect_chain_headers(
     Performs a lightweight, non-intrusive HTTP header inspection following up to `max_hops`
     redirects without downloading response bodies (stream=True + immediate close).
     Fail-safe: returns None on any network error, timeout, or redirect loop.
+    Enforces strict SSRF protection: validates destination IP before EVERY hop to block
+    Loopback, RFC 1918 Private networks, Link-local, and Cloud Metadata (169.254.169.254).
     """
     if not url or not url.lower().startswith(("http://", "https://")):
         return None
 
     parsed = urlparse(url)
-    if _is_rfc2606_test_host(parsed.hostname or ""):
+    init_host = (parsed.hostname or "").lower()
+    if not init_host or _is_rfc2606_test_host(init_host):
+        return None
+
+    # Pre-flight SSRF & Scope Guard on initial target
+    is_safe_init, reason_init = is_safe_host_or_ip(init_host)
+    if not is_safe_init:
         return None
 
     session = requests.Session()
@@ -2322,7 +2337,23 @@ def _inspect_redirect_chain_headers(
                 initial_status = status_code
 
             if status_code in (301, 302, 303, 307, 308) and headers_lower.get("location"):
-                next_url = urljoin(current_url, headers_lower["location"].strip())
+                loc_header = headers_lower["location"].strip()
+                # Pre-hop validation: check target before issuing new request
+                is_safe_hop, next_url, hop_reason = validate_redirect_hop(current_url, loc_header)
+                if not is_safe_hop or not next_url:
+                    # Halt following unsafe/external private redirects immediately
+                    return {
+                        "initial_url": url,
+                        "initial_status": initial_status,
+                        "is_redirect": len(hops) > 0,
+                        "redirect_hops": hops,
+                        "final_url": current_url,
+                        "final_status": status_code,
+                        "final_headers": headers_lower,
+                        "blocked_redirect": loc_header,
+                        "blocked_reason": hop_reason,
+                    }
+
                 hops.append({
                     "from": current_url,
                     "status_code": status_code,

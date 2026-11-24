@@ -219,8 +219,8 @@ def classify_scope(
         # If CNAME didn't flag, check CDN & ASN signals
         if not is_third_party:
             if cdn:
-                # CDN Detected (e.g. cloudflare, google, akamai, etc.)
-                is_third_party = True
+                # CDN Detected (e.g. cloudflare, google, akamai, etc.) — reverse proxy/cache for target
+                is_third_party = False
                 hosting_type = "cloud_cdn"
                 provider_name = f"Cloud CDN ({cdn.title()})"
             elif as_name:
@@ -248,7 +248,8 @@ def classify_scope(
         scope_tag=scope_tag,
         is_third_party=is_third_party,
         provider=provider_name,
-        redirect_url=target_redirect_url
+        redirect_url=target_redirect_url,
+        hosting_type=hosting_type
     )
 
     return {
@@ -268,14 +269,15 @@ def build_scope_badge(
     scope_tag: Optional[str] = None,
     is_third_party: bool = False,
     provider: Optional[str] = None,
-    redirect_url: Optional[str] = None
+    redirect_url: Optional[str] = None,
+    hosting_type: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     Constructs a visual badge dictionary for dashboard and API presentation.
     Colors:
       - green  : In-Scope internal assets (full DAST testing allowed)
-      - orange : Third-party SaaS / Cloud assets (Takeover passive check only)
-      - blue   : External redirection (out of target boundary)
+      - orange : Third-party SaaS / Cloud assets (inventory/classification only - no probing)
+      - blue   : External redirection (out of target boundary - no probing)
     """
     tag = scope_tag or ("third_party_passive" if is_third_party else "in_scope_full")
     prov = provider or "Self-Hosted"
@@ -285,16 +287,24 @@ def build_scope_badge(
             "label": f"External Redirect -> {redirect_url or 'External Domain'}",
             "color": "blue",
             "dast_allowed": False,
-            "takeover_checked": True,
-            "description": "يعيد التوجيه لنطاق خارجي - مستبعد من DAST ومفحوص لـ Takeover"
+            "takeover_checked": False,
+            "description": "يعيد التوجيه لنطاق خارجي - مستبعد كلياً من الفحص الأمني (تصنيف وجرد فقط)"
         }
-    elif is_third_party or tag == "third_party_passive":
+    elif tag == "third_party_passive" or (is_third_party and hosting_type == "third_party_saas"):
         return {
             "label": f"Third-Party SaaS ({prov})",
             "color": "orange",
             "dast_allowed": False,
-            "takeover_checked": True,
-            "description": f"مستضاف لدى طرف ثالث ({prov}) - مستبعد من DAST ومفحوص لـ Takeover"
+            "takeover_checked": False,
+            "description": f"مستضاف لدى طرف ثالث ({prov}) - مستبعد كلياً من الفحص الأمني (تصنيف وجرد فقط)"
+        }
+    elif hosting_type == "cloud_cdn":
+        return {
+            "label": f"CDN-Protected ({prov})",
+            "color": "green",
+            "dast_allowed": True,
+            "takeover_checked": False,
+            "description": f"أصل داخلي محمي عبر ({prov}) - مسموح فحص DAST الكامل"
         }
     else:
         return {
@@ -318,7 +328,7 @@ def load_scoped_urls(session_dir: str) -> Dict[str, List[str]]:
     - in_scope_urls     : scope_tag == "in_scope_full"
                           → safe for all DAST tools (Nuclei CVE, Wapiti, Kiterunner)
     - third_party_urls  : scope_tag in ("third_party_passive", "external_redirect")
-                          → allowed ONLY for Nuclei Subdomain-Takeover passive check
+                          → excluded from all active and passive security probing (Zero-Touch)
     - all_urls          : every URL found regardless of scope
 
     Falls back to active_urls.txt (plain list, treated as in_scope_full)

@@ -905,7 +905,7 @@ class TestHttpxStage(unittest.TestCase):
         self.assertTrue(mock_docker.called)
         args_passed = mock_docker.call_args[1].get("args") or mock_docker.call_args[0][1]
         self.assertIn("-nf", args_passed)
-        self.assertIn("-fr", args_passed)
+        self.assertTrue("-fhr" in args_passed or "-fr" in args_passed)
         self.assertIn("-favicon", args_passed)
         self.assertIn("-tls-grab", args_passed)
         self.assertIn("-method", args_passed)

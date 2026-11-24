@@ -132,8 +132,14 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
     origin_ip = None
     target_root_domain = None
     if waf_info.get("waf_bypassed") and waf_info.get("verified_origins"):
-        origin_ip = waf_info["verified_origins"][0].get("origin_ip")
-        target_root_domain = waf_info.get("domain")
+        candidate = waf_info["verified_origins"][0].get("origin_ip")
+        from core.target_validator import is_safe_ip_address
+        if candidate and is_safe_ip_address(candidate):
+            origin_ip = candidate
+            target_root_domain = waf_info.get("domain")
+        else:
+            origin_ip = None
+            target_root_domain = None
 
     seen_inputs: Set[str] = set()
     valid_inputs: List[str] = []
@@ -203,7 +209,7 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         "-favicon",
         "-tls-grab",
         "-method",
-        "-fr",
+        "-fhr",
         "-timeout", "5",
         "-retries", "1",
         "-nf",
@@ -296,7 +302,7 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
                 "-favicon",
                 "-tls-grab",
                 "-method",
-                "-fr",
+                "-fhr",
                 "-timeout", "5",
                 "-retries", "1",
                 "-nf",
@@ -793,15 +799,32 @@ def run_kiterunner_or_api_probing(
             wordlist_param = f"/opt/kiterunner/{KITERUNNER_WORDLIST_NAME}"
             used_wordlist_sha256 = KITERUNNER_WORDLIST_SHA256
 
-    # Source active URLs from parameter or active_urls.txt
+    # Source active URLs from parameter or scoped in-scope URLs from session
     current_active = list(active_urls) if active_urls else []
-    active_urls_txt = os.path.join(session_dir, "active_urls.txt")
-    if not current_active and os.path.exists(active_urls_txt):
-        try:
-            with open(active_urls_txt, "r", encoding="utf-8", errors="replace") as f:
-                current_active = [line.strip() for line in f if line.strip()]
-        except Exception:
-            current_active = []
+    from core.scope_classifier import load_scoped_urls
+    scoped_data = load_scoped_urls(session_dir)
+    in_scope_set = set(scoped_data.get("in_scope_urls", []))
+    third_party_set = set(scoped_data.get("third_party_urls", []))
+
+    if not current_active:
+        current_active = list(scoped_data.get("in_scope_urls", []))
+
+    if not current_active and not (in_scope_set or third_party_set):
+        active_urls_txt = os.path.join(session_dir, "active_urls.txt")
+        if os.path.exists(active_urls_txt):
+            try:
+                with open(active_urls_txt, "r", encoding="utf-8", errors="replace") as f:
+                    current_active = [line.strip() for line in f if line.strip()]
+            except Exception:
+                current_active = []
+
+    # Scope Guard: strictly exclude any third-party SaaS or external redirect URLs from Kiterunner
+    if third_party_set and current_active:
+        filtered_active = [u for u in current_active if u not in third_party_set]
+        excluded_from_kr = len(current_active) - len(filtered_active)
+        if excluded_from_kr > 0:
+            print(f"[Scope Guard] Kiterunner Engine: استبعاد {excluded_from_kr} رابط تابع لطرف ثالث / تحويل خارجي من فحص الـ APIs.", flush=True)
+        current_active = filtered_active
 
     # Target normalization, validation and deduplication (preserving order)
     valid_inputs: List[str] = []

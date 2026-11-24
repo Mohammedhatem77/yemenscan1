@@ -36,7 +36,7 @@ services:
   web:
     build: .
     image: yemenscan1-web:latest
-    pull_policy: build
+    pull_policy: if_not_present
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -76,7 +76,7 @@ services:
 
   worker:
     image: yemenscan1-web:latest
-    pull_policy: build
+    pull_policy: if_not_present
     restart: unless-stopped
     command: celery -A core.tasks worker -E --loglevel=info --concurrency=2
     environment:
@@ -114,7 +114,7 @@ services:
 
   flower:
     image: yemenscan1-web:latest
-    pull_policy: build
+    pull_policy: if_not_present
     restart: unless-stopped
     command: celery -A core.tasks flower --port=5555
     ports:

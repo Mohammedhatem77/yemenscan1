@@ -36,7 +36,7 @@ from core.session import (
     resume_scan_session
 )
 from core.pipeline import run_full_pipeline
-from core.target_validator import validate_target_domain, TargetValidationError
+from core.target_validator import validate_target_domain, validate_standalone_target, TargetValidationError
 from core.target_prioritizer import prioritize_hosts, prioritize_ports, prioritize_urls, prioritize_dict_records
 from core.scope_classifier import build_scope_badge
 from core.tasks import (
@@ -45,6 +45,8 @@ from core.tasks import (
     dispatch_stage2,
     dispatch_stage3,
     dispatch_tool,
+    dispatch_standalone_tool,
+    BrokerConnectionError,
 )
 
 from datetime import datetime
@@ -92,12 +94,6 @@ from core.execution_engine import (
     run_stage2_pipeline,
     run_stage3_pipeline,
     run_tool_in_session,
-    run_standalone_subfinder,
-    run_standalone_naabu,
-    run_standalone_httpx,
-    run_standalone_kiterunner,
-    run_standalone_nuclei,
-    run_standalone_wapiti,
     get_tools_readiness_status,
 )
 
@@ -1387,28 +1383,22 @@ def normalize_vulnerability_endpoint(vuln_payload: Dict[str, Any]):
 
 @app.post("/api/nuclei/scan", include_in_schema=False)
 def scan_nuclei_endpoint(req: NucleiScanRequest):
-    """Executes an on-demand targeted Nuclei scan on a URL or endpoint."""
-    from core.stage3_vulnerabilities import run_standalone_nuclei
-    if not req.target or len(req.target.strip()) < 4:
+    """Executes an on-demand targeted Nuclei scan on a URL or endpoint via Celery."""
+    if not req.target or len(req.target.strip()) < 3:
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط هدف صالح للفحص.")
     
     try:
-        clean_domain, _ = validate_target_domain(req.target, check_dns=True)
+        clean_target = validate_standalone_target("nuclei", req.target.strip())
     except TargetValidationError as ve:
-        raise HTTPException(status_code=ve.status_code, detail=ve.message)
+        raise HTTPException(status_code=400, detail=str(ve))
 
-    target = req.target.strip()
-    if not target.startswith("http://") and not target.startswith("https://"):
-        target = f"http://{clean_domain}"
-        
-    findings = run_standalone_nuclei(target, category=req.category)
-    return {
-        "status": "success",
-        "target": target,
-        "category": req.category or "all",
-        "total_findings": len(findings),
-        "findings": findings
-    }
+    try:
+        opts = {"category": req.category} if req.category else {}
+        return dispatch_standalone_tool("nuclei", clean_target, options=opts)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 # =====================================================================
@@ -1417,67 +1407,179 @@ def scan_nuclei_endpoint(req: NucleiScanRequest):
 
 @app.post("/api/tools/subfinder", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_subfinder_endpoint(req: StandaloneSubfinderReq):
-    """تشغيل Subfinder المستقل لاكتشاف النطاقات الفرعية لنطاق محدد."""
+    """تشغيل Subfinder المستقل لاكتشاف النطاقات الفرعية لنطاق محدد عبر Celery."""
     if not req.domain or len(req.domain.strip()) < 3:
         raise HTTPException(status_code=400, detail="يرجى إدخال نطاق صالح للبحث عن نطاقاته الفرعية.")
     try:
-        clean_domain, _ = validate_target_domain(req.domain, check_dns=False)
-    except Exception:
-        clean_domain = req.domain.strip()
-    return run_standalone_subfinder(clean_domain)
+        clean_domain = validate_standalone_target("subfinder", req.domain)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    try:
+        return dispatch_standalone_tool("subfinder", clean_domain)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/tools/naabu", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_naabu_endpoint(req: StandaloneNaabuReq):
-    """تشغيل Naabu المستقل لفحص المنافذ المفتوحة لنطاق أو عنوان IP محدد."""
+    """تشغيل Naabu المستقل لفحص المنافذ المفتوحة لنطاق أو عنوان IP محدد عبر Celery."""
     if not req.target or len(req.target.strip()) < 3:
         raise HTTPException(status_code=400, detail="يرجى إدخال هدف صالح لفحص المنافذ.")
-    return run_standalone_naabu(req.target, req.ports)
+    try:
+        clean_target = validate_standalone_target("naabu", req.target)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    try:
+        opts = {"ports": req.ports} if req.ports else {}
+        return dispatch_standalone_tool("naabu", clean_target, options=opts)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/tools/httpx", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_httpx_endpoint(req: StandaloneHttpxReq):
-    """تشغيل HTTPX المستقل للتحقق من خدمات الويب النشطة وبصمات التقنيات."""
+    """تشغيل HTTPX المستقل للتحقق من خدمات الويب النشطة وبصمات التقنيات عبر Celery."""
     if not req.targets:
         raise HTTPException(status_code=400, detail="يرجى إرسال قائمة بالأهداف (نطاقات أو عناوين IP أو روابط).")
-    return run_standalone_httpx(req.targets)
+    try:
+        clean_targets = validate_standalone_target("httpx", req.targets)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    try:
+        return dispatch_standalone_tool("httpx", clean_targets)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/tools/kiterunner", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_kiterunner_endpoint(req: StandaloneKiterunnerReq):
-    """تشغيل Kiterunner المستقل لاكتشاف مسارات APIs و Endpoints الحساسة."""
-    if not req.target_url or not req.target_url.strip().startswith("http"):
+    """تشغيل Kiterunner المستقل لاكتشاف مسارات APIs و Endpoints الحساسة عبر Celery."""
+    if not req.target_url:
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    return run_standalone_kiterunner(req.target_url)
+    try:
+        clean_target = validate_standalone_target("kiterunner", req.target_url)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    try:
+        return dispatch_standalone_tool("kiterunner", clean_target)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/tools/nuclei", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_nuclei_endpoint(req: StandaloneNucleiReq):
-    """تشغيل Nuclei المستقل لفحص الثغرات وفق قوالب محددة ودرجات الخطورة."""
-    if not req.target_url or len(req.target_url.strip()) < 3:
+    """تشغيل Nuclei المستقل لفحص الثغرات وفق قوالب محددة ودرجات الخطورة عبر Celery."""
+    if not req.target_url:
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب أو نطاق صالح للفحص.")
-    return run_standalone_nuclei(
-        target_url=req.target_url,
-        severity=req.severity,
-        category=req.category,
-        tags=req.tags
-    )
+    try:
+        clean_target = validate_standalone_target("nuclei", req.target_url)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    opts = {}
+    if req.severity:
+        opts["severity"] = req.severity
+    if req.category:
+        opts["category"] = req.category
+    if req.tags:
+        opts["tags"] = req.tags
+    try:
+        return dispatch_standalone_tool("nuclei", clean_target, options=opts)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.post("/api/tools/wapiti", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
-    """تشغيل Wapiti المستقل للفحص الديناميكي للثغرات الحركية (DAST)."""
-    if not req.target_url or not req.target_url.strip().startswith("http"):
+    """تشغيل Wapiti المستقل للفحص الديناميكي للثغرات الحركية (DAST) عبر Celery."""
+    if not req.target_url:
         raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
+    try:
+        clean_target = validate_standalone_target("wapiti", req.target_url)
+    except TargetValidationError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     _VALID_PROFILES = {"safe", "dast_light", "deep"}
     prof = req.profile if req.profile in _VALID_PROFILES else "safe"
-    return run_standalone_wapiti(req.target_url, modules=req.modules, profile=prof)
+    opts = {"profile": prof}
+    if req.modules:
+        opts["modules"] = req.modules
+    try:
+        return dispatch_standalone_tool("wapiti", clean_target, options=opts)
+    except BrokerConnectionError as bce:
+        raise HTTPException(status_code=503, detail=str(bce))
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
 
 
 @app.get("/api/tools/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
 def get_tools_status_endpoint():
     """التحقق من جاهزية وحالة الحاويات الست والأدوات في النظام."""
     return get_tools_readiness_status()
+
+
+@app.get("/api/tools/{scan_id}/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
+def get_standalone_tool_status_endpoint(scan_id: str):
+    """الاستعلام عن حالة تقدم وتنفيذ فحص الأداة المستقلة في الخلفية."""
+    status = get_status(scan_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"جلسة الفحص المستقل '{scan_id}' غير موجودة.")
+    return {
+        "status": status.get("status"),
+        "scan_id": scan_id,
+        "tool": status.get("tool"),
+        "target": status.get("target"),
+        "current_stage": status.get("current_stage"),
+        "progress_percentage": status.get("progress_percentage", 0),
+        "is_completed": status.get("is_completed", False),
+        "has_error": status.get("has_error", False),
+        "error_message": status.get("error_message"),
+        "logs": status.get("logs", [])
+    }
+
+
+@app.get("/api/tools/{scan_id}/results", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
+def get_standalone_tool_results_endpoint(scan_id: str):
+    """استرجاع نتائج فحص الأداة المستقلة بعد اكتمال تنفيذها عبر Celery."""
+    status = get_status(scan_id)
+    if not status:
+        raise HTTPException(status_code=404, detail=f"جلسة الفحص المستقل '{scan_id}' غير موجودة.")
+
+    if not status.get("is_completed"):
+        return {
+            "status": status.get("status", "running"),
+            "scan_id": scan_id,
+            "tool": status.get("tool"),
+            "is_completed": False,
+            "message": "عملية الفحص ما زالت قيد التنفيذ في الخلفية."
+        }
+
+    # Load results from status or file
+    results = status.get("results")
+    if not results:
+        session_dir = get_session_dir(scan_id)
+        results_file = os.path.join(session_dir, "results.json")
+        if os.path.exists(results_file):
+            try:
+                with open(results_file, "r", encoding="utf-8") as rf:
+                    results = json.load(rf)
+            except Exception:
+                pass
+
+    if not results:
+        if status.get("has_error"):
+            raise HTTPException(status_code=500, detail=status.get("error_message") or "فشل تشغيل الأداة في الخلفية.")
+        results = {"tool": status.get("tool"), "status": "completed", "findings": []}
+
+    return results
 
 
 @app.post("/api/tools/origin-ip", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])

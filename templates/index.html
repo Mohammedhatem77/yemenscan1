@@ -2623,6 +2623,55 @@
                 });
                 const data = await res.json();
 
+                if (!res.ok) {
+                    if (loading) loading.style.display = 'none';
+                    if (btn) btn.disabled = false;
+                    const errMsg = data.detail || data.message || 'حدث خطأ في الخادم.';
+                    if (body) body.innerHTML = `<tr><td colspan="6" class="empty-state" style="color:#ef4444;">❌ فشل إرسال طلب الفحص: ${errMsg}</td></tr>`;
+                    return;
+                }
+
+                // Handle Asynchronous Celery Execution Mode
+                if (data.status === 'scheduled' && data.scan_id) {
+                    const scanId = data.scan_id;
+                    if (loadingText) loadingText.textContent = `⏳ تمت جدولة فحص ${cfg.name} (المعرف: ${scanId}) عبر عامل Celery... جاري المتابعة`;
+
+                    const pollStartTime = Date.now();
+                    const pollInterval = setInterval(async () => {
+                        try {
+                            const statRes = await fetch(`${API_BASE}/api/tools/${scanId}/status`);
+                            if (!statRes.ok) return;
+                            const statData = await statRes.json();
+
+                            if (statData.is_completed) {
+                                clearInterval(pollInterval);
+                                if (loading) loading.style.display = 'none';
+                                if (btn) btn.disabled = false;
+
+                                if (statData.has_error || statData.status === 'failed' || statData.status === 'scheduling_failed') {
+                                    const failMsg = statData.error_message || 'فشل تشغيل الأداة في الخلفية.';
+                                    if (body) body.innerHTML = `<tr><td colspan="6" class="empty-state" style="color:#ef4444;">❌ حدث خطأ أثناء تشغيل أداة ${cfg.name}: ${failMsg}</td></tr>`;
+                                    return;
+                                }
+
+                                // Retrieve finalized findings
+                                const resRes = await fetch(`${API_BASE}/api/tools/${scanId}/results`);
+                                const resData = await resRes.json();
+                                standaloneLastData = resData;
+                                standaloneLastTarget = target;
+                                renderStandaloneResults(currentStandaloneTool, resData);
+                            } else {
+                                const elapsed = Math.round((Date.now() - pollStartTime) / 1000);
+                                if (loadingText) loadingText.textContent = `⏳ جاري تنفيذ فحص ${cfg.name} في الخلفية (${elapsed} ثانية)... يرجى الانتظار`;
+                            }
+                        } catch (pollErr) {
+                            console.error('Polling error:', pollErr);
+                        }
+                    }, 1500);
+                    return;
+                }
+
+                // Legacy Direct Execution Fallback (if any synchronous tool returns immediately)
                 if (loading) loading.style.display = 'none';
                 if (btn) btn.disabled = false;
 

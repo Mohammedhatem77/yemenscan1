@@ -8,6 +8,7 @@ is unavailable (e.g. during local tests).
 
 import os
 import sys
+import json
 import logging
 from typing import Optional, Dict, Any
 
@@ -18,11 +19,33 @@ from core.execution_engine import (
     run_stage2_pipeline,
     run_stage3_pipeline,
     run_tool_in_session,
+    run_standalone_subfinder,
+    run_standalone_naabu,
+    run_standalone_httpx,
+    run_standalone_kiterunner,
+    run_standalone_nuclei,
+    run_standalone_wapiti,
+)
+from core.session import (
+    create_standalone_session,
+    get_session_dir,
+    get_status,
+    update_status,
 )
 from core.db_service import ingest_scan_from_directory, complete_scan_session
 from database import SessionLocal
 
 logger = logging.getLogger("yemenscan.tasks")
+
+
+class BrokerConnectionError(Exception):
+    """Raised when task scheduling fails due to broker unreachability or Celery errors."""
+    pass
+
+
+ALLOWED_STANDALONE_TOOLS = {"subfinder", "naabu", "httpx", "kiterunner", "nuclei", "wapiti"}
+ALLOWED_STANDALONE_OPTIONS = {"ports", "severity", "category", "tags", "modules", "profile", "targets"}
+
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +112,136 @@ def celery_update_nuclei_templates(self):
     """Executes asynchronous background template update & validation."""
     from core.template_updater import run_template_update_job
     return run_template_update_job()
+
+
+@celery_app.task(
+    bind=True,
+    name="yemenscan.tasks.standalone_tool",
+    soft_time_limit=1800,
+    time_limit=2400
+)
+def celery_run_standalone_tool(
+    self,
+    scan_id: str,
+    tool_name: str,
+    target: Any,
+    options: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Executes an independent security tool (Subfinder, Naabu, HTTPX, Kiterunner, Nuclei, Wapiti)
+    asynchronously inside a Celery worker, updating status and persisting results.
+    """
+    tool_clean = str(tool_name or "").strip().lower()
+    if tool_clean not in ALLOWED_STANDALONE_TOOLS:
+        err = f"Tool '{tool_clean}' is not in allowed standalone tools list."
+        logger.error("[Celery Worker] %s", err)
+        update_status(scan_id, status="failed", stage="failed", is_completed=True, has_error=True, error=err)
+        raise ValueError(err)
+
+    # Defense-in-depth: re-verify target safety inside Celery Worker before Docker execution
+    from core.target_validator import validate_standalone_target, TargetValidationError
+    try:
+        clean_target = validate_standalone_target(tool_clean, target)
+    except TargetValidationError as ve:
+        err = f"فشل التحقق الأمني داخل عامل Celery للهدف: {str(ve)}"
+        logger.error("[Celery Worker] %s", err)
+        update_status(scan_id, status="failed", stage="failed", is_completed=True, has_error=True, error=err, log_message=err)
+        raise ValueError(err)
+
+    session_dir = get_session_dir(scan_id)
+    opts = options or {}
+    logger.info("[Celery Worker] Starting standalone tool %s for scan %s (target=%s)", tool_clean, scan_id, clean_target)
+
+    update_status(
+        scan_id,
+        status="running",
+        stage=f"running_{tool_clean}",
+        tool=tool_clean,
+        progress=20,
+        log_message=f"بدء تشغيل أداة {tool_clean} المستقلة في عامل Celery..."
+    )
+
+    try:
+        if tool_clean == "subfinder":
+            res = run_standalone_subfinder(domain=str(clean_target), session_dir=session_dir, scan_id=scan_id)
+        elif tool_clean == "naabu":
+            ports = opts.get("ports")
+            res = run_standalone_naabu(target=str(clean_target), ports=ports, session_dir=session_dir, scan_id=scan_id)
+        elif tool_clean == "httpx":
+            targets = clean_target if isinstance(clean_target, list) else [str(clean_target)]
+            res = run_standalone_httpx(targets=targets, session_dir=session_dir, scan_id=scan_id)
+        elif tool_clean == "kiterunner":
+            res = run_standalone_kiterunner(target_url=str(clean_target), session_dir=session_dir, scan_id=scan_id)
+        elif tool_clean == "nuclei":
+            res = run_standalone_nuclei(
+                target_url=str(clean_target),
+                severity=opts.get("severity"),
+                category=opts.get("category"),
+                tags=opts.get("tags"),
+                session_dir=session_dir,
+                scan_id=scan_id
+            )
+        elif tool_clean == "wapiti":
+            res = run_standalone_wapiti(
+                target_url=str(clean_target),
+                modules=opts.get("modules"),
+                profile=opts.get("profile", "safe"),
+                session_dir=session_dir,
+                scan_id=scan_id
+            )
+        else:
+            raise ValueError(f"Unhandled tool: {tool_clean}")
+
+        # Persist results in session directory
+        results_file = os.path.join(session_dir, "results.json")
+        try:
+            with open(results_file, "w", encoding="utf-8") as rf:
+                json.dump(res, rf, ensure_ascii=False, indent=2)
+        except Exception as fe:
+            logger.warning("[Celery Worker] Could not write results.json for %s: %s", scan_id, fe)
+
+        # Update status
+        is_success = res.get("status") == "success"
+        final_status = "completed" if is_success else "failed"
+
+        # Save results directly in status.json
+        status_file = os.path.join(session_dir, "status.json")
+        try:
+            if os.path.exists(status_file):
+                with open(status_file, "r", encoding="utf-8") as sf:
+                    s_dict = json.load(sf)
+                s_dict["results"] = res
+                with open(status_file, "w", encoding="utf-8") as sf:
+                    json.dump(s_dict, sf, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        update_status(
+            scan_id,
+            status=final_status,
+            stage="completed" if is_success else "failed",
+            tool=tool_clean,
+            progress=100,
+            is_completed=True,
+            has_error=not is_success,
+            tool_status={tool_clean: "success" if is_success else "failed"},
+            log_message=f"اكتمل تنفيذ أداة {tool_clean} بنجاح." if is_success else f"انتهى تنفيذ أداة {tool_clean} بحالة فشل."
+        )
+        return res
+    except Exception as e:
+        logger.error("[Celery Worker] Error executing standalone tool %s for %s: %s", tool_clean, scan_id, e)
+        update_status(
+            scan_id,
+            status="failed",
+            stage="failed",
+            tool=tool_clean,
+            progress=100,
+            is_completed=True,
+            has_error=True,
+            error=str(e),
+            log_message=f"حدث استثناء أثناء تشغيل أداة {tool_clean}: {str(e)}"
+        )
+        raise e
 
 
 # ---------------------------------------------------------------------------
@@ -251,4 +404,89 @@ def dispatch_template_update(background_tasks=None) -> Dict[str, str]:
         import threading
         threading.Thread(target=run_template_update_job, daemon=True).start()
     return {"mode": "background_tasks", "status": "started", "message": "تم بدء تحديث القوالب في الخلفية."}
+
+
+def dispatch_standalone_tool(
+    tool_name: str,
+    target: Any,
+    options: Optional[Dict[str, Any]] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Validates tool and inputs, registers a standalone scan session, and dispatches
+    the task strictly to Celery. If Redis broker is unreachable, records failure and
+    raises BrokerConnectionError. Strictly prohibits direct in-process tool execution.
+    """
+    tool_clean = str(tool_name or "").strip().lower()
+    if tool_clean not in ALLOWED_STANDALONE_TOOLS:
+        raise ValueError(
+            f"الأداة غير معروفة: '{tool_name}'. الأدوات المسموحة هي: {', '.join(sorted(ALLOWED_STANDALONE_TOOLS))}"
+        )
+
+    # Validate target presence and security boundaries
+    if not target or (isinstance(target, str) and not target.strip()) or (isinstance(target, list) and not target):
+        raise ValueError("الهدف المطلوب فحصه غير صالح أو فارغ.")
+
+    from core.target_validator import validate_standalone_target, TargetValidationError
+    try:
+        clean_target = validate_standalone_target(tool_clean, target)
+    except TargetValidationError as ve:
+        raise ValueError(str(ve))
+
+    # Validate options whitelist: prevent arbitrary CLI/Docker injection
+    opts = options or {}
+    disallowed_keys = set(opts.keys()) - ALLOWED_STANDALONE_OPTIONS
+    if disallowed_keys:
+        raise ValueError(f"خيارات تشغيل غير مصرح بها: {', '.join(sorted(disallowed_keys))}")
+
+    # Create tracked session
+    if not scan_id:
+        scan_id = create_standalone_session(tool_clean, clean_target, opts)
+
+    # Check broker reachability
+    if not is_celery_broker_reachable():
+        err_msg = "تعذر الاتصال بخادم الرسائل (Redis). لا يمكن جدولة الفحص المستقل حالياً."
+        logger.error("[Celery Dispatcher] Broker unreachable for standalone %s (scan_id=%s)", tool_clean, scan_id)
+        update_status(
+            scan_id,
+            status="scheduling_failed",
+            stage="scheduling_failed",
+            is_completed=True,
+            has_error=True,
+            error=err_msg,
+            log_message="تعذر إرسال المهمة إلى وسيط الرسائل (Redis). تم إيقاف الفحص بأمان دون تشغيل محلي."
+        )
+        raise BrokerConnectionError(err_msg)
+
+    # Dispatch to Celery with deterministic task ID to avoid duplicate submission
+    try:
+        task = celery_run_standalone_tool.apply_async(
+            args=[scan_id, tool_clean, clean_target, opts],
+            task_id=f"standalone_{scan_id}"
+        )
+        print(f"[+] Standalone tool {tool_clean} for {scan_id} dispatched to Celery worker (task_id={task.id}).", flush=True)
+        return {
+            "status": "scheduled",
+            "scan_id": scan_id,
+            "tool": tool_clean,
+            "task_id": task.id,
+            "target": target,
+            "message": f"تمت جدولة فحص أداة {tool_clean} بنجاح عبر عامل Celery في الخلفية.",
+            "status_endpoint": f"/api/tools/{scan_id}/status",
+            "results_endpoint": f"/api/tools/{scan_id}/results"
+        }
+    except Exception as ex:
+        err_msg = f"فشل إرسال المهمة إلى Celery: {str(ex)}"
+        logger.error("[Celery Dispatcher] Failed to enqueue task %s: %s", scan_id, ex)
+        update_status(
+            scan_id,
+            status="scheduling_failed",
+            stage="scheduling_failed",
+            is_completed=True,
+            has_error=True,
+            error=err_msg,
+            log_message=f"فشل إرسال المهمة إلى Celery: {str(ex)}"
+        )
+        raise BrokerConnectionError(err_msg)
+
 
