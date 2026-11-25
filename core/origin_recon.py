@@ -220,8 +220,13 @@ def find_candidate_origin_ips(domain: str, additional_subdomains: Optional[List[
             logger.debug("[Scope Guard] Skipping unproxied candidate %s: points to third-party SaaS.", sub_fqdn)
             continue
 
+        from core.target_validator import is_safe_ip_address
         sub_ips = resolve_domain_ips(sub_fqdn)
         for ip in sub_ips:
+            # Scope & SSRF Guard: ensure candidate IP is safe public address
+            if not is_safe_ip_address(ip):
+                logger.debug("[Scope Guard] Skipping IP %s: private, loopback, link-local, or cloud metadata.", ip)
+                continue
             in_cdn, _ = is_ip_in_cdn(ip)
             if not in_cdn:
                 if is_ip_associated_with_cloud_saas(ip):
@@ -237,6 +242,9 @@ def verify_origin_ip(candidate_ip: str, target_domain: str, baseline_title: Opti
     Verifies if candidate_ip is a genuine Origin Server by sending a direct
     HTTP request with 'Host: <target_domain>' header and comparing responses.
     """
+    from core.target_validator import is_safe_ip_address
+    if not is_safe_ip_address(candidate_ip):
+        return False, f"Candidate IP {candidate_ip} is rejected by Scope Guard (private, loopback, link-local, or cloud metadata)."
     clean_dom = target_domain.strip().lower()
     if clean_dom.startswith("http://") or clean_dom.startswith("https://"):
         clean_dom = urlparse(clean_dom).netloc.split(":")[0]

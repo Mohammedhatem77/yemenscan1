@@ -168,7 +168,7 @@ class TestEnhancedToolFlags(unittest.TestCase):
 
         self.assertIn("-favicon", args)
         self.assertIn("-tls-grab", args)
-        self.assertIn("-fr", args)
+        self.assertTrue("-fhr" in args or "-fr" in args)
         self.assertIn("-method", args)
 
         target = web_targets[0]

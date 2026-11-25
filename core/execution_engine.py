@@ -309,11 +309,7 @@ def run_stage3_pipeline(scan_id: str, scan_profile: str = "safe") -> Dict[str, A
 
     if excluded_count > 0:
         print(
-            f"[Scope Guard] ✅ تم استبعاد {excluded_count} أصل تابع لطرف ثالث من فحص DAST الكامل.",
-            flush=True
-        )
-        print(
-            f"[Scope Guard] 🔍 سيتم فحص {excluded_count} أصل بـ Nuclei (Takeover فقط) كفحص سلبي.",
+            f"[Scope Guard] 🛡️ استبعاد كامل: تم استبعاد {excluded_count} أصل تابع لطرف ثالث من كافة الفحوصات الأمنية (سياسة Zero-Touch).",
             flush=True
         )
 
@@ -347,18 +343,14 @@ def run_stage3_pipeline(scan_id: str, scan_profile: str = "safe") -> Dict[str, A
     else:
         print("[Scope Guard] ⚠️ لا توجد أصول داخلية — تخطي فحص Nuclei CVE.", flush=True)
 
-    # ── 2. Nuclei — فحص Subdomain Takeover على الأصول التابعة لطرف ثالث ─────
+    # ── 2. أصول الطرف الثالث — مستبعدة كلياً من أي فحص شبكي (Zero-Touch Policy) ─────
     takeover_findings: List[Dict[str, Any]] = []
 
     if third_party_urls:
         print(
-            f"[Scope Guard] 🎯 تشغيل Nuclei Takeover على {len(third_party_urls)} نطاق تابع لطرف ثالث...",
+            f"[Scope Guard] 🛡️ استبعاد كامل: تم استبعاد {len(third_party_urls)} أصل تابع لطرف ثالث من الفحص الأمني (اكتفاء بالتصنيف وجرد الأصول).",
             flush=True
         )
-        ok_tak, takeover_findings = _run_nuclei_takeover_check(
-            session_dir, scan_id, third_party_urls
-        )
-        nuclei_findings = nuclei_findings + takeover_findings
 
     # ── 3. Wapiti DAST — على الأصول الداخلية فقط ────────────────────────────
     wapiti_findings: List[Dict[str, Any]] = []
@@ -391,9 +383,8 @@ def run_stage3_pipeline(scan_id: str, scan_profile: str = "safe") -> Dict[str, A
         is_completed=True,
         log_message=(
             f"اكتملت المرحلة الثالثة: {len(nuclei_findings)} ثغرة عبر Nuclei "
-            f"(منها {len(takeover_findings)} Takeover) "
             f"و {len(wapiti_findings)} ثغرة عبر Wapiti. "
-            f"تم استبعاد {excluded_count} أصل تابع لطرف ثالث من DAST."
+            f"تم استبعاد {excluded_count} أصل تابع لطرف ثالث من كافة الفحوصات."
         )
     )
 
@@ -472,29 +463,22 @@ def run_tool_in_session(scan_id: str, tool_name: str, options: Optional[Dict[str
         return {"tool": "kiterunner", "status": "success" if ok else "failed", "api_endpoints": api_endpoints, "count": len(api_endpoints)}
 
     elif tool_lower == "nuclei":
-        # ── Scope Guard: فحص CVE على الداخلي، Takeover على الطرف الثالث ──
+        # ── Scope Guard: فحص الأصول الداخلية فقط واستبعاد أصول الأطراف الثالثة كلياً ──
         scoped = load_scoped_urls(session_dir)
         in_scope_urls    = scoped["in_scope_urls"]
         third_party_urls = scoped["third_party_urls"]
         if scoped["excluded_count"] > 0:
             print(
-                f"[Scope Guard] Nuclei: استبعاد {scoped['excluded_count']} أصل من فحص CVE. "
-                f"سيُفحص {scoped['third_party_count']} منها بـ Takeover فقط.",
+                f"[Scope Guard] Nuclei: استبعاد {scoped['excluded_count']} أصل تابع لطرف ثالث من الفحص (سياسة Zero-Touch).",
                 flush=True
             )
 
         all_findings: List[Dict[str, Any]] = []
-        # فحص CVE/OWASP على الأصول الداخلية
+        # فحص CVE/OWASP على الأصول الداخلية فقط
         if in_scope_urls:
             prepare_nuclei_targets(session_dir)
             ok_nuc, cve_findings = run_nuclei(session_dir, scan_id)
             all_findings.extend(cve_findings)
-        # فحص Takeover على الطرف الثالث
-        if third_party_urls:
-            ok_tak, tak_findings = _run_nuclei_takeover_check(
-                session_dir, scan_id, third_party_urls
-            )
-            all_findings.extend(tak_findings)
 
         return {
             "tool": "nuclei",
@@ -503,7 +487,8 @@ def run_tool_in_session(scan_id: str, tool_name: str, options: Optional[Dict[str
             "count": len(all_findings),
             "scope_guard": {
                 "in_scope_count": scoped["in_scope_count"],
-                "third_party_takeover_count": scoped["third_party_count"],
+                "third_party_count": scoped["third_party_count"],
+                "excluded_count": scoped["excluded_count"],
             }
         }
 
@@ -532,25 +517,35 @@ def run_tool_in_session(scan_id: str, tool_name: str, options: Optional[Dict[str
 # 3. Independent Standalone Tool Execution (الفحص المستقل للأدوات)
 # ---------------------------------------------------------------------------
 
-def run_standalone_subfinder(domain: str) -> Dict[str, Any]:
+def run_standalone_subfinder(
+    domain: str,
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Runs Subfinder independently on a domain, returning discovered subdomains."""
-    run_id = f"subfinder_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
+    run_id = scan_id or f"subfinder_{uuid.uuid4().hex[:8]}"
+    work_dir = session_dir or os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
     ok, subdomains = run_subfinder(domain, work_dir, run_id)
     return {
         "tool": "subfinder",
         "status": "success" if ok else "failed",
+        "scan_id": run_id,
         "target_domain": domain,
         "subdomains_count": len(subdomains),
         "subdomains": subdomains
     }
 
 
-def run_standalone_naabu(target: str, ports: Optional[str] = None) -> Dict[str, Any]:
+def run_standalone_naabu(
+    target: str,
+    ports: Optional[str] = None,
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Runs Naabu independently on a host or IP, returning open ports."""
-    run_id = f"naabu_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
+    run_id = scan_id or f"naabu_{uuid.uuid4().hex[:8]}"
+    work_dir = session_dir or os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
     clean_target = target.strip()
@@ -558,16 +553,21 @@ def run_standalone_naabu(target: str, ports: Optional[str] = None) -> Dict[str, 
     return {
         "tool": "naabu",
         "status": "success" if ok else "failed",
+        "scan_id": run_id,
         "target": clean_target,
         "open_ports_count": len(open_ports),
         "open_ports": open_ports
     }
 
 
-def run_standalone_httpx(targets: List[str]) -> Dict[str, Any]:
+def run_standalone_httpx(
+    targets: List[str],
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Runs HTTPX independently on a list of URLs or hosts."""
-    run_id = f"httpx_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
+    run_id = scan_id or f"httpx_{uuid.uuid4().hex[:8]}"
+    work_dir = session_dir or os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
     # Write input targets to ports.txt and httpx_input.txt (using newline="\n" for Linux Docker compatibility)
@@ -585,16 +585,21 @@ def run_standalone_httpx(targets: List[str]) -> Dict[str, Any]:
     return {
         "tool": "httpx",
         "status": "success" if ok else "failed",
+        "scan_id": run_id,
         "total_active_urls": len(active_urls),
         "active_urls": active_urls,
         "web_targets": web_targets
     }
 
 
-def run_standalone_kiterunner(target_url: str) -> Dict[str, Any]:
+def run_standalone_kiterunner(
+    target_url: str,
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Runs Kiterunner independently to discover API routes."""
-    run_id = f"kiterunner_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
+    run_id = scan_id or f"kiterunner_{uuid.uuid4().hex[:8]}"
+    work_dir = session_dir or os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
     cleaned = target_url.strip()
@@ -615,6 +620,7 @@ def run_standalone_kiterunner(target_url: str) -> Dict[str, Any]:
     return {
         "tool": "kiterunner",
         "status": "success" if ok else "failed",
+        "scan_id": run_id,
         "target_url": target_url.strip(),
         "total_api_endpoints": len(api_endpoints),
         "api_endpoints": api_endpoints,
@@ -628,9 +634,12 @@ def run_standalone_nuclei(
     target_url: str,
     severity: Optional[str] = None,
     category: Optional[str] = None,
-    tags: Optional[str] = None
+    tags: Optional[str] = None,
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """Runs Nuclei independently against a target URL or domain with full template library and controls."""
+    run_id = scan_id or f"nuclei_{uuid.uuid4().hex[:8]}"
     findings = _run_standalone_nuclei_backend(
         target_url=target_url,
         category=category,
@@ -640,22 +649,30 @@ def run_standalone_nuclei(
     return {
         "tool": "nuclei",
         "status": "success",
+        "scan_id": run_id,
         "target_url": target_url.strip(),
         "total_findings": len(findings),
         "findings": findings
     }
 
 
-def run_standalone_wapiti(target_url: str, modules: Optional[str] = None, profile: str = "safe") -> Dict[str, Any]:
+def run_standalone_wapiti(
+    target_url: str,
+    modules: Optional[str] = None,
+    profile: str = "safe",
+    session_dir: Optional[str] = None,
+    scan_id: Optional[str] = None
+) -> Dict[str, Any]:
     """Runs Wapiti DAST independently against a target URL."""
-    run_id = f"wapiti_{uuid.uuid4().hex[:8]}"
-    work_dir = os.path.join(STANDALONE_DIR, run_id)
+    run_id = scan_id or f"wapiti_{uuid.uuid4().hex[:8]}"
+    work_dir = session_dir or os.path.join(STANDALONE_DIR, run_id)
     os.makedirs(work_dir, exist_ok=True)
 
     ok, findings = run_wapiti_dast(work_dir, run_id, [target_url.strip()], profile=profile, modules=modules)
     return {
         "tool": "wapiti",
         "status": "success" if ok else "failed",
+        "scan_id": run_id,
         "target_url": target_url.strip(),
         "profile": profile,
         "total_findings": len(findings),

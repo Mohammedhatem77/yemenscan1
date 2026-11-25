@@ -16,7 +16,6 @@ from core.stage3_vulnerabilities import (
     unify_and_save_vulnerabilities
 )
 from core.scope_classifier import load_scoped_urls
-from core.execution_engine import _run_nuclei_takeover_check
 
 def package_session_evidence_and_metadata(
     session_dir: str,
@@ -452,13 +451,29 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", res
             )
             return
 
-        # 4. Kiterunner
+        # ── Scope Guard: عزل أصول الطرف الثالث وتطبيق نطاق الفحص الصارم قبل Kiterunner ──
+        scoped = load_scoped_urls(session_dir)
+        in_scope_urls    = scoped.get("in_scope_urls") or []
+        third_party_urls = scoped.get("third_party_urls") or []
+        excluded_count   = scoped.get("excluded_count") or 0
+
+        # Fallback to active_urls if scoped list is empty
+        if not in_scope_urls and active_urls:
+            in_scope_urls = [u for u in active_urls if u]
+
+        if excluded_count > 0:
+            print(
+                f"[Scope Guard] ✅ خط الفحص الكامل: استبعاد {excluded_count} أصل تابع لطرف ثالث / تحويل خارجي من فحص واجهات البرمجة (Kiterunner) وفحص الثغرات (DAST & CVEs).",
+                flush=True
+            )
+
+        # 4. Kiterunner API Probing (على الأصول المؤهلة الداخلية فقط)
         api_endpoints_json = os.path.join(session_dir, "api_endpoints.json")
         kiterunner_meta = os.path.join(session_dir, "kiterunner_metadata.json")
         kiterunner_done = False
         api_endpoints: List[Dict[str, Any]] = []
 
-        if active_urls:
+        if in_scope_urls:
             if is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled.")
 
@@ -484,12 +499,13 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", res
                     kiterunner_done = False
 
             if not kiterunner_done:
-                ok_api, api_endpoints = run_kiterunner_or_api_probing(active_urls, session_dir, scan_id)
+                ok_api, api_endpoints = run_kiterunner_or_api_probing(in_scope_urls, session_dir, scan_id)
                 if ok_api:
                     tool_statuses["kiterunner"] = "success" if api_endpoints else "empty"
                 else:
                     tool_statuses["kiterunner"] = "failed"
         else:
+            print("[Scope Guard] Kiterunner: تخطي الفحص — لا توجد أصول داخلية مؤهلة لفحص واجهات البرمجة.", flush=True)
             tool_statuses["kiterunner"] = "skipped"
             api_endpoints = []
         
@@ -504,22 +520,6 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", res
             progress=70,
             tool_status=tool_statuses
         )
-
-        # ── Scope Guard: عزل أصول الطرف الثالث وتطبيق نطاق الفحص الصارم ──
-        scoped = load_scoped_urls(session_dir)
-        in_scope_urls    = scoped.get("in_scope_urls") or []
-        third_party_urls = scoped.get("third_party_urls") or []
-        excluded_count   = scoped.get("excluded_count") or 0
-
-        # Fallback to active_urls if scoped list is empty
-        if not in_scope_urls and active_urls:
-            in_scope_urls = [u for u in active_urls if u]
-
-        if excluded_count > 0:
-            print(
-                f"[Scope Guard] ✅ خط الفحص الكامل: استبعاد {excluded_count} أصل تابع لطرف ثالث من DAST و CVEs.",
-                flush=True
-            )
 
         # 1. Nuclei — فحص CVEs على الأصول الداخلية فقط
         all_targets = prepare_nuclei_targets(session_dir)
@@ -573,15 +573,12 @@ def run_full_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", res
             tool_statuses["nuclei"] = "skipped"
             ok_nuc = True
 
-        # 2. Nuclei Takeover — فحص سلبي أحادي فقط على أصول الطرف الثالث
-        if third_party_urls and not nuclei_done:
+        # 2. أصول الطرف الثالث وإعادة التوجيه الخارجية — مستبعدة كلياً من أي فحص شبكي (Zero-Touch Policy)
+        if third_party_urls:
             print(
-                f"[Scope Guard] 🎯 تشغيل Nuclei Takeover على {len(third_party_urls)} أصل خارجي...",
+                f"[Scope Guard] 🛡️ استبعاد كامل: {len(third_party_urls)} أصل تابع لطرف ثالث / إعادة توجيه خارج نطاق الفحص (تم الاكتفاء بالتصنيف وجرد الأصول).",
                 flush=True
             )
-            ok_tak, tak_findings = _run_nuclei_takeover_check(session_dir, scan_id, third_party_urls)
-            if tak_findings:
-                nuclei_findings = nuclei_findings + tak_findings
 
         # 3. Wapiti DAST — على الأصول الداخلية فقط (استبعاد 100% للطرف الثالث)
         wapiti_findings_file = os.path.join(session_dir, "wapiti_findings.json")

@@ -268,3 +268,59 @@ def resume_scan_session(scan_id: str) -> bool:
                     pass
             return False
 
+
+def create_standalone_session(
+    tool_name: str,
+    target: Any,
+    options: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Initializes a tracked standalone tool scan session directory under SCANS_DIR
+    with a fully standardized status.json.
+    Format: standalone_<tool>_<YYYYMMDD_HHMMSS>_<rand>_<clean_target>
+    """
+    ensure_scans_dir()
+    tool_clean = tool_name.strip().lower()
+    target_str = ", ".join(target) if isinstance(target, list) else str(target or "")
+    clean_target = "".join(c if c.isalnum() or c in ".-_" else "_" for c in target_str)[:30].strip("._-") or "target"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rand_suffix = uuid.uuid4().hex[:6]
+    scan_id = f"standalone_{tool_clean}_{timestamp}_{rand_suffix}_{clean_target}"
+
+    from core.runner import clear_scan_cancelled
+    clear_scan_cancelled(scan_id)
+
+    session_dir = os.path.join(SCANS_DIR, scan_id)
+    os.makedirs(session_dir, exist_ok=True)
+
+    initial_status = {
+        "scan_id": scan_id,
+        "session_type": "standalone",
+        "tool": tool_clean,
+        "target": target,
+        "target_domain": target_str,
+        "options": options or {},
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat(),
+        "status": "queued",
+        "current_stage": f"queued_{tool_clean}",
+        "current_tool": tool_clean,
+        "progress_percentage": 0,
+        "tool_statuses": {tool_clean: "queued"},
+        "stats": {},
+        "logs": [
+            f"[{datetime.now().strftime('%H:%M:%S')}] تم إنشاء جلسة الفحص المستقل للأداة ({tool_clean}) للهدف: {target_str}"
+        ],
+        "results": None,
+        "is_completed": False,
+        "has_error": False,
+        "error_message": None
+    }
+
+    status_file = os.path.join(session_dir, "status.json")
+    with _STATUS_LOCK:
+        with open(status_file, "w", encoding="utf-8") as f:
+            json.dump(initial_status, f, ensure_ascii=False, indent=2)
+
+    return scan_id
+

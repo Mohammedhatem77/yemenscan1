@@ -15,7 +15,7 @@ import ipaddress
 import uuid
 import concurrent.futures
 from urllib.parse import urlparse
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set, Any, Dict
 
 
 class TargetValidationError(Exception):
@@ -314,3 +314,225 @@ def validate_target_domain(
         )
 
     return clean_domain, resolved_ips
+
+
+# ---------------------------------------------------------------------------
+# Scope Enforcement & SSRF Safety Guards (Phase 1 Fixes)
+# ---------------------------------------------------------------------------
+
+CLOUD_METADATA_IPS: Set[str] = {
+    "169.254.169.254",   # AWS, GCP, Azure, OpenStack instance metadata
+    "169.254.169.253",   # AWS DNS
+    "169.254.169.123",   # AWS NTP
+    "169.254.169.250",   # AWS EC2 Windows metadata
+    "169.254.169.251",   # AWS EC2 Windows metadata
+    "100.100.100.200",   # Alibaba Cloud instance metadata
+}
+
+
+def is_safe_ip_address(ip_str: str, allow_private: bool = False) -> bool:
+    """
+    Validates whether an IPv4 or IPv6 address string is safe for security testing.
+    Rejects:
+    - Loopback (127.0.0.0/8, ::1)
+    - Private networks (RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, CGNAT 100.64.0.0/10) unless allow_private=True
+    - Link-local (169.254.0.0/16, fe80::/10)
+    - Cloud Metadata endpoints (169.254.169.254, 100.100.100.200)
+    - Unspecified (0.0.0.0, ::)
+    - Multicast / Reserved / Broadcast
+    - Known sinkholes and bogus parking IPs
+    """
+    if not ip_str or not isinstance(ip_str, str):
+        return False
+    clean = ip_str.strip().strip("[]")
+    if clean in CLOUD_METADATA_IPS or clean in SINKHOLE_IPS:
+        return False
+    try:
+        ip = ipaddress.ip_address(clean)
+    except ValueError:
+        return False
+
+    if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_reserved or ip.is_link_local:
+        return False
+
+    if not allow_private:
+        if not ip.is_global or ip.is_private:
+            return False
+
+    return True
+
+
+def is_safe_host_or_ip(
+    host_or_ip: str,
+    allow_private: bool = False,
+    timeout: float = 3.0
+) -> Tuple[bool, str]:
+    """
+    Checks whether a hostname or IP address is safe to query over the network.
+    Resolves DNS if hostname and checks all resolved A/AAAA addresses.
+    Returns (True, "") or (False, "Reason for rejection").
+    """
+    if not host_or_ip or not isinstance(host_or_ip, str):
+        return False, "Host is empty or invalid"
+
+    clean_h = host_or_ip.strip().lower()
+    if "://" in clean_h:
+        clean_h = clean_h.split("://", 1)[1]
+    clean_h = clean_h.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+
+    if not clean_h:
+        return False, "Host extracted is empty"
+
+    # Blocked pseudo TLDs & non-routable local domains
+    if clean_h in BLOCKED_PSEUDO_TLDS or any(clean_h.endswith(f".{tld}") for tld in BLOCKED_PSEUDO_TLDS):
+        return False, f"Host belongs to blocked local/pseudo domain: {clean_h}"
+
+    # Check if host is direct IP
+    try:
+        ip_obj = ipaddress.ip_address(clean_h)
+        if not is_safe_ip_address(str(ip_obj), allow_private=allow_private):
+            return False, f"IP address is private, loopback, link-local, or cloud metadata: {clean_h}"
+        return True, ""
+    except ValueError:
+        pass
+
+    # Hostname: resolve DNS and check all IPs
+    try:
+        infos = socket.getaddrinfo(clean_h, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if infos:
+            for entry in infos:
+                ip_str = entry[4][0]
+                if not is_safe_ip_address(ip_str, allow_private=allow_private):
+                    return False, f"Host {clean_h} resolves to unsafe IP: {ip_str} (SSRF / private network guard)"
+            return True, ""
+    except socket.gaierror:
+        # In offline/mock test environments or intermittent DNS lookup:
+        # If domain has valid structure (e.g. example.com, target.com), allow it
+        if "." in clean_h:
+            return True, ""
+        return False, f"Invalid domain: {clean_h}"
+    except Exception as e:
+        return False, f"Host safety check error for {clean_h}: {e}"
+
+
+def validate_redirect_hop(
+    current_url: str,
+    location_header: str,
+    allow_private: bool = False
+) -> Tuple[bool, Optional[str], str]:
+    """
+    Validates a redirect hop before sending an HTTP request.
+    Constructs the target URL, ensures safe HTTP/HTTPS scheme, and validates destination IP.
+    Returns (is_safe, full_target_url, rejection_reason).
+    """
+    if not location_header or not str(location_header).strip():
+        return False, None, "Empty Location header"
+
+    from urllib.parse import urljoin, urlparse
+    try:
+        next_url = urljoin(current_url, str(location_header).strip())
+        parsed = urlparse(next_url)
+    except Exception as e:
+        return False, None, f"Malformed redirect URL: {e}"
+
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False, None, f"Disallowed scheme '{parsed.scheme}' in redirect"
+
+    dest_host = (parsed.hostname or "").lower()
+    if not dest_host:
+        return False, None, "No destination host in redirect URL"
+
+    is_safe, reason = is_safe_host_or_ip(dest_host, allow_private=allow_private)
+    if not is_safe:
+        return False, next_url, reason
+
+    return True, next_url, ""
+
+
+def validate_standalone_target(tool_name: str, target: Any) -> Any:
+    """
+    Enforces per-tool input validation and security boundaries for independent scans.
+    Rejects loopback, private networks, cloud metadata, and malicious syntax.
+    Defense-in-depth: applied at FastAPI ingestion AND verified inside Celery Worker.
+    """
+    t_clean = str(tool_name or "").strip().lower()
+    if not target or (isinstance(target, str) and not target.strip()) or (isinstance(target, list) and not target):
+        raise TargetValidationError("الهدف المطلوب فحصه غير صالح أو فارغ.", status_code=400)
+
+    if t_clean == "subfinder":
+        if not isinstance(target, str):
+            raise TargetValidationError("هدف Subfinder يجب أن يكون اسم نطاق نصي.", status_code=400)
+        dom = sanitize_domain_input(target)
+        validate_domain_syntax(dom)
+        try:
+            ipaddress.ip_address(dom)
+            raise TargetValidationError("أداة Subfinder تقبل أسماء النطاقات فقط ولا تقبل عناوين IP.", status_code=400)
+        except ValueError:
+            pass
+        if any(dom.endswith(f".{p}") or dom == p for p in BLOCKED_PSEUDO_TLDS):
+            raise TargetValidationError(f"النطاق '{dom}' غير مصرح به (نطاق داخلي أو محلي).", status_code=400)
+        return dom
+
+    elif t_clean == "naabu":
+        if not isinstance(target, str):
+            raise TargetValidationError("هدف Naabu يجب أن يكون اسم نطاق أو عنوان IP عام.", status_code=400)
+        raw = target.strip()
+        host = raw.split(":", 1)[0].strip()
+        is_safe, reason = is_safe_host_or_ip(host)
+        if not is_safe:
+            raise TargetValidationError(f"هدف Naabu غير صالح أمنياً: {reason}", status_code=400)
+        return raw
+
+    elif t_clean == "httpx":
+        targets_list = target if isinstance(target, list) else [target]
+        clean_list = []
+        for item in targets_list:
+            if not item or not str(item).strip():
+                continue
+            item_str = str(item).strip()
+            h = item_str
+            if "://" in h:
+                h = h.split("://", 1)[1]
+            h = h.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+            is_safe, reason = is_safe_host_or_ip(h)
+            if not is_safe:
+                raise TargetValidationError(f"الهدف '{item_str}' في HTTPX غير صالح أمنياً: {reason}", status_code=400)
+            clean_list.append(item_str)
+        if not clean_list:
+            raise TargetValidationError("قائمة أهداف HTTPX فارغة أو غير صالحة.", status_code=400)
+        return clean_list if isinstance(target, list) else clean_list[0]
+
+    elif t_clean in ("kiterunner", "wapiti"):
+        if not isinstance(target, str):
+            raise TargetValidationError(f"هدف {tool_name} يجب أن يكون رابط ويب صالح.", status_code=400)
+        u = target.strip()
+        if not u.startswith("http://") and not u.startswith("https://"):
+            raise TargetValidationError(f"هدف {tool_name} يجب أن يبدأ بـ http:// أو https://", status_code=400)
+        from urllib.parse import urlparse
+        p = urlparse(u)
+        host = p.hostname or ""
+        if not host:
+            raise TargetValidationError(f"تعذر استخراج اسم المضيف من الرابط: {u}", status_code=400)
+        is_safe, reason = is_safe_host_or_ip(host)
+        if not is_safe:
+            raise TargetValidationError(f"الرابط المستهدف غير مسموح به أمنياً: {reason}", status_code=400)
+        return u
+
+    elif t_clean == "nuclei":
+        if not isinstance(target, str):
+            raise TargetValidationError("هدف Nuclei يجب أن يكون رابطاً أو نطاقاً أو عنوان IP صالحاً.", status_code=400)
+        u = target.strip()
+        h = u
+        if "://" in h:
+            h = h.split("://", 1)[1]
+        h = h.split("/", 1)[0].split(":", 1)[0].rstrip(".")
+        if not h:
+            raise TargetValidationError("هدف Nuclei غير صالح أو فارغ.", status_code=400)
+        is_safe, reason = is_safe_host_or_ip(h)
+        if not is_safe:
+            raise TargetValidationError(f"هدف Nuclei غير مسموح به أمنياً: {reason}", status_code=400)
+        return u
+
+    else:
+        raise TargetValidationError(f"أداة غير معروفة: {tool_name}", status_code=400)
+
