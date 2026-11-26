@@ -27,18 +27,28 @@ from core.nuclei_template_selector import (
     RuntimeTemplateMissingError
 )
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-NUCLEI_TEMPLATES_DIR = os.path.join(BASE_DIR, "nuclei_templates")
-NUCLEI_TEMPLATES_OFFICIAL_DIR = os.path.join(BASE_DIR, "nuclei_templates_official")
-NUCLEI_RUNTIME_TEMPLATES_DIR = os.path.join(BASE_DIR, "nuclei_runtime_templates")
-NUCLEI_RUNTIME_MANIFEST_PATH = os.path.join(BASE_DIR, "nuclei_runtime_manifest.json")
-
-NUCLEI_DOCKER_IMAGE = "projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb"
-NUCLEI_ENGINE_VERSION = "v3.11.1"
-NUCLEI_ENGINE_DIGEST = "sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb"
-NUCLEI_TEMPLATES_VERSION = "v10.5.1"
-NUCLEI_TEMPLATES_COMMIT = "79fb682760ab3d5b0e22afbb44709353cbebf023"
-NUCLEI_TEMPLATES_CHECKSUM = "8a8a34ea672e2ee3674092112e5e6934309fc9aa"
+from core.nuclei_shared import (
+    BASE_DIR,
+    NUCLEI_TEMPLATES_DIR,
+    NUCLEI_TEMPLATES_OFFICIAL_DIR,
+    NUCLEI_RUNTIME_TEMPLATES_DIR,
+    NUCLEI_RUNTIME_MANIFEST_PATH,
+    NUCLEI_DOCKER_IMAGE,
+    NUCLEI_ENGINE_VERSION,
+    NUCLEI_ENGINE_DIGEST,
+    NUCLEI_TEMPLATES_VERSION,
+    NUCLEI_TEMPLATES_COMMIT,
+    NUCLEI_TEMPLATES_CHECKSUM,
+    NUCLEI_SAFE_FLAGS,
+    normalize_target_origin,
+    normalize_matched_url,
+    parse_nuclei_json_output,
+    get_nuclei_templates_info,
+)
+from core.nuclei_standalone import (
+    run_standalone_nuclei as _run_standalone_nuclei_impl,
+    build_standalone_nuclei_args,
+)
 
 WAPITI_DOCKER_IMAGE = "yemscan/wapiti:3.3.2"
 WAPITI_ENGINE_VERSION = "3.3.2"
@@ -91,77 +101,6 @@ def verify_wapiti_image_identity(
             raise
         return True
 
-NUCLEI_SAFE_FLAGS: List[str] = [
-    "-severity", "medium,high,critical",
-    "-pt", "http",
-    "-etags", "dos,fuzz,bruteforce,intrusive,local",
-    "-dut",
-    "-ni",
-    "-lna",
-    "-iv", "4",
-    "-irr",
-    "-rl", "10",
-    "-c", "5",
-    "-bs", "5",
-    "-timeout", "5",
-    "-retries", "0",
-    "-duc",
-    "-nc",
-    "-silent"
-]
-
-def normalize_target_origin(url_str: str) -> Optional[str]:
-    """
-    Normalizes an HTTP/HTTPS URL into its canonical base origin (scheme://hostname[:port]).
-    - Strips whitespace.
-    - Lowers scheme and hostname.
-    - Strips trailing dots from hostname.
-    - Omits default ports (80 for http, 443 for https).
-    - Omits paths, query parameters, fragments, userinfo.
-    Returns None if invalid.
-    """
-    if not url_str or not isinstance(url_str, str):
-        return None
-    raw = url_str.strip()
-    if "://" in raw:
-        proto = raw.split("://", 1)[0].lower()
-        if proto not in ("http", "https"):
-            return None
-    else:
-        raw = f"http://{raw}"
-    try:
-        parsed = urlparse(raw)
-        scheme = (parsed.scheme or "http").lower()
-        if scheme not in ("http", "https"):
-            return None
-        hostname = (parsed.hostname or "").lower().rstrip(".")
-        if not hostname:
-            return None
-        port = parsed.port
-        if (scheme == "http" and port == 80) or (scheme == "https" and port == 443) or port is None:
-            return f"{scheme}://{hostname}"
-        if port is not None:
-            return f"{scheme}://{hostname}:{port}"
-        return f"{scheme}://{hostname}"
-    except Exception:
-        return None
-
-def normalize_matched_url(matched_url: str) -> str:
-    """
-    Normalizes a matched URL for deduplication while preserving path/query if present.
-    """
-    if not matched_url:
-        return ""
-    try:
-        parsed = urlparse(matched_url.strip())
-        origin = normalize_target_origin(matched_url)
-        if not origin:
-            return matched_url.strip()
-        path = parsed.path.rstrip("/")
-        query = f"?{parsed.query}" if parsed.query else ""
-        return f"{origin}{path}{query}"
-    except Exception:
-        return matched_url.strip()
 
 def write_nuclei_template_manifest(session_dir: str) -> Dict[str, Any]:
     """Writes the official immutable template & execution manifest for auditability."""
@@ -870,7 +809,8 @@ def run_native_nuclei_fallback(
 
     return findings
 
-def parse_nuclei_json_output(
+# parse_nuclei_json_output is imported from core.nuclei_shared
+def _legacy_parse_nuclei_json_output(
     nuclei_raw_file: str,
     valid_target_origins: Optional[Set[str]] = None
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
@@ -1503,118 +1443,24 @@ def run_standalone_nuclei(
     severity: Optional[str] = None,
     tags: Optional[str] = None,
     rate_limit: int = 150,
-    concurrency: int = 25
+    concurrency: int = 25,
+    **kwargs
 ) -> List[Dict[str, Any]]:
     """
-    Runs a targeted safe Nuclei scan on a specific URL or domain using the official Docker container.
-    Liberated from template starvation: supports full official template libraries, direct category/tag
-    filtering, configurable severities, and high-performance adaptive rate limiting.
+    Backward-compatible entrypoint for standalone Nuclei execution.
+    Delegates to core.nuclei_standalone.run_standalone_nuclei while binding
+    run_docker_tool to respect active test patches.
     """
-    if not target_url or not target_url.strip():
-        return []
-
-    clean_target = target_url.strip()
-    targets: List[str] = []
-    valid_origins: Set[str] = set()
-
-    if clean_target.startswith("http://") or clean_target.startswith("https://"):
-        norm = normalize_target_origin(clean_target)
-        if norm:
-            targets.append(norm)
-            valid_origins.add(norm)
-    else:
-        # Target provided without scheme (e.g. toom.de): test both HTTPS and HTTP
-        dom = clean_target.split("/")[0].split(":")[0].strip()
-        https_origin = f"https://{dom}"
-        http_origin = f"http://{dom}"
-        targets = [https_origin, http_origin]
-        valid_origins = {https_origin, http_origin}
-
-    if not targets:
-        return []
-
-    tmp_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scans", ".tmp"))
-    os.makedirs(tmp_base, exist_ok=True)
-    temp_dir = tempfile.mkdtemp(prefix="nuclei_single_", dir=tmp_base)
-    try:
-        tf = os.path.join(temp_dir, "nuclei_targets.txt")
-        with open(tf, "w", encoding="utf-8") as f:
-            for t in targets:
-                f.write(f"{t}\n")
-
-        target_templates_dir = NUCLEI_RUNTIME_TEMPLATES_DIR if os.path.exists(NUCLEI_RUNTIME_TEMPLATES_DIR) else NUCLEI_TEMPLATES_OFFICIAL_DIR
-        extra_vols = [(target_templates_dir, "/opt/nuclei-templates")]
-
-        # Determine template directory or path
-        selected_t_arg = "/opt/nuclei-templates"
-        additional_tags = []
-        if tags and tags.strip():
-            additional_tags.append(tags.strip())
-
-        if category and category.lower() not in ("all", "", "*", "none"):
-            clean_cat = category.strip().lower()
-            # 1. Check if category matches a subfolder under http/ or root
-            cat_http_path = os.path.join(target_templates_dir, "http", clean_cat)
-            cat_direct_path = os.path.join(target_templates_dir, clean_cat)
-            if os.path.exists(cat_http_path):
-                selected_t_arg = f"/opt/nuclei-templates/http/{clean_cat}"
-            elif os.path.exists(cat_direct_path):
-                selected_t_arg = f"/opt/nuclei-templates/{clean_cat}"
-            else:
-                # 2. Category is a technology or tag (e.g. wordpress, php, apache, nginx, iis, api)
-                http_sub = os.path.join(target_templates_dir, "http")
-                selected_t_arg = "/opt/nuclei-templates/http" if os.path.exists(http_sub) else "/opt/nuclei-templates"
-                additional_tags.append(clean_cat)
-        else:
-            http_sub = os.path.join(target_templates_dir, "http")
-            if os.path.exists(http_sub):
-                selected_t_arg = "/opt/nuclei-templates/http"
-
-        effective_severity = (severity or "medium,high,critical").strip()
-        if effective_severity.lower() in ("all", "*"):
-            effective_severity = "info,low,medium,high,critical"
-
-        args = [
-            "-l", "/data/nuclei_targets.txt",
-            "-t", selected_t_arg,
-            "-jsonl",
-            "-o", "/data/nuclei_raw.jsonl",
-            "-severity", effective_severity,
-            "-pt", "http",
-            "-etags", "dos,fuzz,bruteforce,intrusive,local",
-            "-dut",
-            "-ni",
-            "-lna",
-            "-iv", "4",
-            "-irr",
-            "-rl", str(rate_limit),
-            "-c", str(concurrency),
-            "-bs", str(concurrency),
-            "-timeout", "6",
-            "-retries", "1",
-            "-duc",
-            "-nc",
-            "-silent"
-        ]
-
-        if additional_tags:
-            combined_tags = ",".join(t for t in additional_tags if t)
-            args.extend(["-tags", combined_tags])
-
-        success, _ = run_docker_tool(
-            image=NUCLEI_DOCKER_IMAGE,
-            args=args,
-            volume_dir=temp_dir,
-            timeout=300,
-            extra_volumes=extra_vols
-        )
-        if not success:
-            return []
-        raw_file = os.path.join(temp_dir, "nuclei_raw.jsonl")
-        findings, _ = parse_nuclei_json_output(raw_file, valid_target_origins=valid_origins)
-        return findings
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    kwargs.setdefault("run_docker_tool_fn", run_docker_tool)
+    return _run_standalone_nuclei_impl(
+        target_url=target_url,
+        category=category,
+        severity=severity,
+        tags=tags,
+        rate_limit=rate_limit,
+        concurrency=concurrency,
+        **kwargs
+    )
 
 def parse_wapiti_json_output(
     raw_path: str,
