@@ -117,6 +117,17 @@ tags_metadata = [
 ]
 
 from routers.auth import router as auth_router
+from routers.standalone_tools import (
+    router as standalone_tools_router,
+    StandaloneSubfinderReq,
+    StandaloneNaabuReq,
+    StandaloneHttpxReq,
+    StandaloneKiterunnerReq,
+    StandaloneNucleiReq,
+    StandaloneWapitiReq,
+    OriginReconReq,
+    SaveStandaloneReq,
+)
 
 app = FastAPI(
     title="YemenScan - منظومة الفحص الأمني السحابي",
@@ -137,6 +148,9 @@ _allowed_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()
 
 # Register Authentication & RBAC Router
 app.include_router(auth_router, prefix="/api/auth")
+
+# Register Standalone Independent Security Tools Router
+app.include_router(standalone_tools_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -170,33 +184,6 @@ class Stage1RunRequest(BaseModel):
 
 class SessionToolRunRequest(BaseModel):
     options: Optional[Dict[str, Any]] = None
-
-class StandaloneSubfinderReq(BaseModel):
-    domain: str
-
-class StandaloneNaabuReq(BaseModel):
-    target: str
-    ports: Optional[str] = None
-
-class StandaloneHttpxReq(BaseModel):
-    targets: List[str]
-
-class StandaloneKiterunnerReq(BaseModel):
-    target_url: str
-
-class StandaloneNucleiReq(BaseModel):
-    target_url: str
-    severity: Optional[str] = "medium,high,critical"
-    category: Optional[str] = None
-    tags: Optional[str] = None
-
-class StandaloneWapitiReq(BaseModel):
-    target_url: str
-    modules: Optional[str] = None
-    profile: Optional[str] = "safe"  # 'safe' | 'dast_light' | 'deep'
-
-class OriginReconReq(BaseModel):
-    domain: str
 
 class NucleiScanRequest(BaseModel):
     target: str
@@ -1403,192 +1390,8 @@ def scan_nuclei_endpoint(req: NucleiScanRequest):
 
 # =====================================================================
 # 3. Independent Security Tools (فحص الأدوات المستقلة)
+# Modularized in routers/standalone_tools.py and mounted via app.include_router
 # =====================================================================
-
-@app.post("/api/tools/subfinder", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_subfinder_endpoint(req: StandaloneSubfinderReq):
-    """تشغيل Subfinder المستقل لاكتشاف النطاقات الفرعية لنطاق محدد عبر Celery."""
-    if not req.domain or len(req.domain.strip()) < 3:
-        raise HTTPException(status_code=400, detail="يرجى إدخال نطاق صالح للبحث عن نطاقاته الفرعية.")
-    try:
-        clean_domain = validate_standalone_target("subfinder", req.domain)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    try:
-        return dispatch_standalone_tool("subfinder", clean_domain)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.post("/api/tools/naabu", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_naabu_endpoint(req: StandaloneNaabuReq):
-    """تشغيل Naabu المستقل لفحص المنافذ المفتوحة لنطاق أو عنوان IP محدد عبر Celery."""
-    if not req.target or len(req.target.strip()) < 3:
-        raise HTTPException(status_code=400, detail="يرجى إدخال هدف صالح لفحص المنافذ.")
-    try:
-        clean_target = validate_standalone_target("naabu", req.target)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    try:
-        opts = {"ports": req.ports} if req.ports else {}
-        return dispatch_standalone_tool("naabu", clean_target, options=opts)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.post("/api/tools/httpx", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_httpx_endpoint(req: StandaloneHttpxReq):
-    """تشغيل HTTPX المستقل للتحقق من خدمات الويب النشطة وبصمات التقنيات عبر Celery."""
-    if not req.targets:
-        raise HTTPException(status_code=400, detail="يرجى إرسال قائمة بالأهداف (نطاقات أو عناوين IP أو روابط).")
-    try:
-        clean_targets = validate_standalone_target("httpx", req.targets)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    try:
-        return dispatch_standalone_tool("httpx", clean_targets)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.post("/api/tools/kiterunner", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_kiterunner_endpoint(req: StandaloneKiterunnerReq):
-    """تشغيل Kiterunner المستقل لاكتشاف مسارات APIs و Endpoints الحساسة عبر Celery."""
-    if not req.target_url:
-        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    try:
-        clean_target = validate_standalone_target("kiterunner", req.target_url)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    try:
-        return dispatch_standalone_tool("kiterunner", clean_target)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.post("/api/tools/nuclei", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_nuclei_endpoint(req: StandaloneNucleiReq):
-    """تشغيل Nuclei المستقل لفحص الثغرات وفق قوالب محددة ودرجات الخطورة عبر Celery."""
-    if not req.target_url:
-        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب أو نطاق صالح للفحص.")
-    try:
-        clean_target = validate_standalone_target("nuclei", req.target_url)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    opts = {}
-    if req.severity:
-        opts["severity"] = req.severity
-    if req.category:
-        opts["category"] = req.category
-    if req.tags:
-        opts["tags"] = req.tags
-    try:
-        return dispatch_standalone_tool("nuclei", clean_target, options=opts)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.post("/api/tools/wapiti", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_standalone_wapiti_endpoint(req: StandaloneWapitiReq):
-    """تشغيل Wapiti المستقل للفحص الديناميكي للثغرات الحركية (DAST) عبر Celery."""
-    if not req.target_url:
-        raise HTTPException(status_code=400, detail="يرجى إدخال رابط ويب يبدأ بـ http:// أو https://")
-    try:
-        clean_target = validate_standalone_target("wapiti", req.target_url)
-    except TargetValidationError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    _VALID_PROFILES = {"safe", "dast_light", "deep"}
-    prof = req.profile if req.profile in _VALID_PROFILES else "safe"
-    opts = {"profile": prof}
-    if req.modules:
-        opts["modules"] = req.modules
-    try:
-        return dispatch_standalone_tool("wapiti", clean_target, options=opts)
-    except BrokerConnectionError as bce:
-        raise HTTPException(status_code=503, detail=str(bce))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@app.get("/api/tools/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def get_tools_status_endpoint():
-    """التحقق من جاهزية وحالة الحاويات الست والأدوات في النظام."""
-    return get_tools_readiness_status()
-
-
-@app.get("/api/tools/{scan_id}/status", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def get_standalone_tool_status_endpoint(scan_id: str):
-    """الاستعلام عن حالة تقدم وتنفيذ فحص الأداة المستقلة في الخلفية."""
-    status = get_status(scan_id)
-    if not status:
-        raise HTTPException(status_code=404, detail=f"جلسة الفحص المستقل '{scan_id}' غير موجودة.")
-    return {
-        "status": status.get("status"),
-        "scan_id": scan_id,
-        "tool": status.get("tool"),
-        "target": status.get("target"),
-        "current_stage": status.get("current_stage"),
-        "progress_percentage": status.get("progress_percentage", 0),
-        "is_completed": status.get("is_completed", False),
-        "has_error": status.get("has_error", False),
-        "error_message": status.get("error_message"),
-        "logs": status.get("logs", [])
-    }
-
-
-@app.get("/api/tools/{scan_id}/results", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def get_standalone_tool_results_endpoint(scan_id: str):
-    """استرجاع نتائج فحص الأداة المستقلة بعد اكتمال تنفيذها عبر Celery."""
-    status = get_status(scan_id)
-    if not status:
-        raise HTTPException(status_code=404, detail=f"جلسة الفحص المستقل '{scan_id}' غير موجودة.")
-
-    if not status.get("is_completed"):
-        return {
-            "status": status.get("status", "running"),
-            "scan_id": scan_id,
-            "tool": status.get("tool"),
-            "is_completed": False,
-            "message": "عملية الفحص ما زالت قيد التنفيذ في الخلفية."
-        }
-
-    # Load results from status or file
-    results = status.get("results")
-    if not results:
-        session_dir = get_session_dir(scan_id)
-        results_file = os.path.join(session_dir, "results.json")
-        if os.path.exists(results_file):
-            try:
-                with open(results_file, "r", encoding="utf-8") as rf:
-                    results = json.load(rf)
-            except Exception:
-                pass
-
-    if not results:
-        if status.get("has_error"):
-            raise HTTPException(status_code=500, detail=status.get("error_message") or "فشل تشغيل الأداة في الخلفية.")
-        results = {"tool": status.get("tool"), "status": "completed", "findings": []}
-
-    return results
-
-
-@app.post("/api/tools/origin-ip", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def run_origin_recon_endpoint(req: OriginReconReq):
-    """كشف السيرفر الحقيقي (Origin IP) وتجاوز جدران الحماية (WAF Bypass)."""
-    from core.origin_recon import run_origin_recon
-    if not req.domain or len(req.domain.strip()) < 3:
-        raise HTTPException(status_code=400, detail="يرجى إدخال نطاق صالح لاستكشاف الأصل.")
-    return run_origin_recon(req.domain.strip())
 
 
 @app.get("/api/templates/status", tags=["4. إدارة وتحديث القوالب (Template Management)"])
@@ -1606,57 +1409,6 @@ def update_templates_endpoint(background_tasks: BackgroundTasks):
 
 
 
-class SaveStandaloneReq(BaseModel):
-    tool: str
-    target: str
-    results: Dict[str, Any]
-
-
-@app.post("/api/tools/save-to-db", tags=["3. فحص الأدوات المستقلة (Independent Security Tools)"])
-def save_standalone_to_db_endpoint(req: SaveStandaloneReq, db: Session = Depends(get_db)):
-    """حفظ نتائج الفحص المستقل كجلسة موثقة في قاعدة البيانات."""
-    try:
-        clean_target = req.target.strip()
-        if "://" in clean_target:
-            domain_part = urlparse(clean_target).netloc or clean_target
-        else:
-            domain_part = clean_target.split("/")[0]
-        domain_part = domain_part.split(":")[0].rstrip(".")
-        if not domain_part:
-            domain_part = "standalone-target"
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rand_id = uuid.uuid4().hex[:6]
-        scan_id = f"standalone_{req.tool}_{timestamp}_{rand_id}"
-
-        target, session = create_target_and_session(db, domain_part, scan_id)
-        
-        tool_lower = req.tool.lower().strip()
-        if tool_lower == "subfinder":
-            subdomains = req.results.get("subdomains", [])
-            save_discovered_assets(db, scan_id, subdomains, [])
-        elif tool_lower == "naabu":
-            open_ports = req.results.get("open_ports", [])
-            save_discovered_assets(db, scan_id, open_ports, [])
-        elif tool_lower == "httpx":
-            web_targets = req.results.get("web_targets", [])
-            active_urls = req.results.get("active_urls", [])
-            save_discovered_assets(db, scan_id, web_targets or active_urls, [])
-        elif tool_lower == "kiterunner":
-            api_endpoints = req.results.get("api_endpoints", [])
-            save_discovered_assets(db, scan_id, [], api_endpoints)
-        elif tool_lower in ("nuclei", "wapiti"):
-            findings = req.results.get("findings", [])
-            ingest_vulnerabilities(db, scan_id, findings)
-            
-        complete_scan_session(db, scan_id, status="completed")
-        return {
-            "status": "success",
-            "scan_id": scan_id,
-            "message": f"تم حفظ نتائج أداة {req.tool} بنجاح في قاعدة البيانات!"
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"فشل حفظ النتائج في قاعدة البيانات: {str(e)}")
 # =====================================================================
 # Strict System Prompts and Post-Processing Sanitizers for AI Reports
 # =====================================================================
