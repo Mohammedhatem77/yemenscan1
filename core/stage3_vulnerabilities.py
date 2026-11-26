@@ -1247,9 +1247,18 @@ def run_nuclei(
 
         # Write profile selected templates file
         tpls_filename = f"selected_templates_{profile_id}.txt"
+        prefer_local = os.getenv("PREFER_LOCAL_TOOLS", "false").lower() in ("true", "1", "yes")
         with open(os.path.join(session_dir, tpls_filename), "w", encoding="utf-8") as ptlf:
             for st in selected_templates:
-                ptlf.write(f"{st['container_path']}\n")
+                if prefer_local:
+                    rel_p = (st.get("relative_path") or "").lstrip("/\\")
+                    local_tpl = os.path.normpath(os.path.join(target_templates_dir, rel_p)).replace("\\", "/")
+                    if os.path.exists(local_tpl):
+                        ptlf.write(f"{local_tpl}\n")
+                    else:
+                        ptlf.write(f"{st['container_path']}\n")
+                else:
+                    ptlf.write(f"{st['container_path']}\n")
 
         raw_filename = f"nuclei_raw_{profile_id}.jsonl"
         effective_severity = (severity or os.getenv("NUCLEI_SEVERITY", "info,low,medium,high,critical")).strip()

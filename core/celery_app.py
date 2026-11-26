@@ -9,9 +9,16 @@ import os
 from celery import Celery
 
 def _resolve_redis_url() -> str:
-    """Intelligently resolves Redis URL, auto-adapting localhost -> redis when inside Docker."""
-    url = os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL") or "redis://redis:6379/0"
-    if "localhost" in url or "127.0.0.1" in url:
+    """Intelligently resolves Redis URL, auto-adapting localhost -> redis when inside Docker, or redis -> 127.0.0.1 when on host."""
+    url = os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL")
+    if not url:
+        try:
+            import socket
+            socket.gethostbyname("redis")
+            url = "redis://redis:6379/0"
+        except Exception:
+            url = "redis://127.0.0.1:6379/0"
+    elif "localhost" in url or "127.0.0.1" in url:
         try:
             import socket
             socket.gethostbyname("redis")
