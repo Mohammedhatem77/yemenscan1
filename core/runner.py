@@ -142,6 +142,107 @@ def is_docker_available() -> bool:
     _DOCKER_CACHE_TIME = now
     return _DOCKER_AVAILABLE_CACHE
 
+def _snapshot_dir_activity(volume_dir: str) -> Tuple[int, float, int]:
+    """Returns lightweight (file_count, max_mtime, total_bytes) snapshot of volume_dir."""
+    if not volume_dir or not os.path.exists(volume_dir):
+        return (0, 0.0, 0)
+    count = 0
+    max_mt = 0.0
+    total_sz = 0
+    try:
+        for root, _, files in os.walk(volume_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                try:
+                    st = os.stat(fpath)
+                    count += 1
+                    total_sz += st.st_size
+                    if st.st_mtime > max_mt:
+                        max_mt = st.st_mtime
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return (count, max_mt, total_sz)
+
+
+def _communicate_with_idle_watchdog(
+    proc: subprocess.Popen,
+    cmd: List[str],
+    volume_dir: str,
+    hard_timeout: Optional[float],
+    idle_timeout: Optional[float],
+    scan_id: Optional[str],
+) -> Tuple[str, str]:
+    """
+    Waits on a real Popen subprocess while tracking both stdout/stderr activity and
+    volume_dir disk mutations. Only triggers idle timeout when a container is genuinely
+    silent and inactive; never prematurely kills active crawls or scans.
+    """
+    if not isinstance(proc, subprocess.Popen):
+        return proc.communicate(timeout=hard_timeout)
+
+    stdout_chunks: List[str] = []
+    stderr_chunks: List[str] = []
+    last_activity = [time.monotonic()]
+    act_lock = threading.Lock()
+
+    def _drain(stream, sink: List[str]) -> None:
+        if stream is None:
+            return
+        try:
+            for line in iter(stream.readline, ""):
+                sink.append(line)
+                with act_lock:
+                    last_activity[0] = time.monotonic()
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, stdout_chunks), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    start_ts = time.monotonic()
+    prev_snap = _snapshot_dir_activity(volume_dir)
+    last_disk_check = start_ts
+
+    while proc.poll() is None:
+        if scan_id and is_scan_cancelled(scan_id):
+            raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")
+
+        now = time.monotonic()
+        if now - last_disk_check >= 5.0:
+            last_disk_check = now
+            cur_snap = _snapshot_dir_activity(volume_dir)
+            if cur_snap != prev_snap:
+                prev_snap = cur_snap
+                with act_lock:
+                    last_activity[0] = now
+
+        if hard_timeout is not None and (now - start_ts) >= hard_timeout:
+            partial = "".join(stdout_chunks)
+            raise subprocess.TimeoutExpired(cmd, hard_timeout, output=partial)
+
+        if idle_timeout is not None and idle_timeout > 0:
+            with act_lock:
+                idle_elapsed = now - last_activity[0]
+            if idle_elapsed >= idle_timeout:
+                partial = "".join(stdout_chunks)
+                raise subprocess.TimeoutExpired(cmd, idle_timeout, output=partial)
+
+        time.sleep(0.05 if (now - start_ts) < 2.0 else 0.5)
+
+    t_out.join(timeout=2.0)
+    t_err.join(timeout=2.0)
+    return "".join(stdout_chunks), "".join(stderr_chunks)
+
+
 def run_docker_tool(
     image: str,
     args: List[str],
@@ -151,7 +252,8 @@ def run_docker_tool(
     extra_volumes: Optional[List[Tuple[str, str]]] = None,
     scan_id: Optional[str] = None,
     extra_hosts: Optional[Dict[str, str]] = None,
-    retries: int = 0
+    retries: int = 0,
+    idle_timeout: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """
     Executes a security tool inside a temporary Docker container mounting volume_dir to /data
@@ -247,7 +349,21 @@ def run_docker_tool(
 
             disable_timeout = os.getenv("DISABLE_TOOL_TIMEOUT", "true").lower() in ("true", "1", "yes")
             effective_timeout = None if (disable_timeout or timeout is None or (isinstance(timeout, (int, float)) and timeout <= 0)) else timeout
-            stdout, stderr = proc.communicate(timeout=effective_timeout)
+            effective_idle: Optional[float] = None
+            if idle_timeout is not None:
+                effective_idle = float(idle_timeout) if idle_timeout > 0 else None
+            else:
+                env_idle = int(os.getenv("YEMENSCAN_IDLE_WATCHDOG_SECONDS", "420"))
+                effective_idle = float(env_idle) if env_idle > 0 else None
+
+            stdout, stderr = _communicate_with_idle_watchdog(
+                proc=proc,
+                cmd=cmd,
+                volume_dir=volume_dir,
+                hard_timeout=effective_timeout,
+                idle_timeout=effective_idle,
+                scan_id=scan_id,
+            )
 
             if scan_id and is_scan_cancelled(scan_id):
                 raise ScanCancelledException(f"Scan {scan_id} was cancelled by user.")

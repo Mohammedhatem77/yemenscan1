@@ -887,6 +887,36 @@ def run_kiterunner_or_api_probing(
 
     targets_for_scan = list(valid_inputs)
 
+    # Layer 1: Pre-Scan Canonical Target Deduplication against Stage 2 HTTPX redirect telemetry
+    active_urls_json_path = os.path.join(session_dir, "active_urls.json")
+    if os.path.exists(active_urls_json_path):
+        try:
+            active_recs = []
+            with open(active_urls_json_path, "r", encoding="utf-8", errors="replace") as af:
+                for line in af:
+                    if line.strip():
+                        try:
+                            rec_obj = json.loads(line.strip())
+                            if isinstance(rec_obj, list):
+                                active_recs.extend([x for x in rec_obj if isinstance(x, dict)])
+                            elif isinstance(rec_obj, dict):
+                                active_recs.append(rec_obj)
+                        except Exception:
+                            pass
+            if active_recs:
+                from core.security_scan_planner import classify_canonical_vs_redirect_targets
+                cls_res = classify_canonical_vs_redirect_targets(targets_for_scan, active_recs)
+                preferred = cls_res.get("canonical_preferred_targets") or []
+                if preferred and len(preferred) < len(targets_for_scan):
+                    skipped_redirs = len(targets_for_scan) - len(preferred)
+                    print(
+                        f"[*] [Layer 1 Pre-Scan] تصفية {skipped_redirs} رابط إعادة توجيه مكرر قبل تشغيل Kiterunner (التركيز على {len(preferred)} وجهة قانونية).",
+                        flush=True,
+                    )
+                    targets_for_scan = preferred
+        except Exception:
+            pass
+
     # When target list is large (> 12 hosts), apply smart ASM prioritization and deduplication
     if len(targets_for_scan) > 12:
         dom = ""

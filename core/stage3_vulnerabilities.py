@@ -1496,6 +1496,30 @@ def parse_wapiti_json_output(
             curl_cmd = occ.get("curl_command") or ""
             level = occ.get("level", 2)
 
+            # Layer 2: Evidence-Aware Normalization — preserve raw HTTP response context
+            detail_obj = occ.get("detail") if isinstance(occ.get("detail"), dict) else {}
+            resp_obj = detail_obj.get("response") if isinstance(detail_obj.get("response"), dict) else {}
+            resp_status = resp_obj.get("status_code")
+            try:
+                resp_status_int = int(resp_status) if resp_status is not None else None
+            except (TypeError, ValueError):
+                resp_status_int = None
+
+            resp_headers_map: Dict[str, str] = {}
+            raw_hdrs = resp_obj.get("headers")
+            if isinstance(raw_hdrs, dict):
+                for hk, hv in raw_hdrs.items():
+                    if hk:
+                        resp_headers_map[str(hk).lower()] = str(hv or "")
+            elif isinstance(raw_hdrs, list):
+                for pair in raw_hdrs:
+                    if isinstance(pair, (list, tuple)) and len(pair) >= 2 and pair[0]:
+                        resp_headers_map[str(pair[0]).lower()] = str(pair[1] or "")
+
+            resp_location = resp_headers_map.get("location", "")
+            resp_content_type = resp_headers_map.get("content-type", "")
+            resp_body_excerpt = str(resp_obj.get("body") or "")[:1500]
+
             # Map category to coverage family
             cat_low = vuln_category.lower()
             if "sql" in cat_low:
@@ -1616,13 +1640,23 @@ def parse_wapiti_json_output(
                 "source": "Wapiti DAST",
                 "sources": ["wapiti"],
                 "source_rule": vuln_category,
+                "response_evidence": {
+                    "status_code": resp_status_int,
+                    "location": resp_location,
+                    "content_type": resp_content_type,
+                    "body_excerpt": resp_body_excerpt,
+                },
                 "source_evidence": {
                     "method": method,
                     "path": path,
                     "parameter": param,
                     "http_request": http_req,
                     "curl_command": curl_cmd,
-                    "info": info
+                    "info": info,
+                    "response_status_code": resp_status_int,
+                    "response_location": resp_location,
+                    "response_content_type": resp_content_type,
+                    "response_body_excerpt": resp_body_excerpt,
                 },
                 "description": info or f"Wapiti DAST reported {vuln_category} on {path}",
                 "remediation": remediation,
@@ -1678,21 +1712,26 @@ def run_wapiti_dast(
     # Load profile config from matrix for timeout/parameter values
     profile_cfg = planner.get_profile_config(profile)
 
-    _wapiti_max_scan_time    = profile_cfg.get("wapiti_max_scan_time", 120)
-    _wapiti_max_attack_time  = profile_cfg.get("wapiti_max_attack_time", 30)
-    _wapiti_tasks            = profile_cfg.get("wapiti_tasks", 2)
+    _default_origins = 25 if profile == "deep" else (15 if profile == "dast_light" else 10)
+    _default_params  = 120 if profile == "deep" else (50 if profile == "dast_light" else 30)
+    _default_links   = 150 if profile == "deep" else (80 if profile == "dast_light" else 50)
+    _default_files   = 120 if profile == "deep" else (60 if profile == "dast_light" else 30)
+
+    _wapiti_max_scan_time    = profile_cfg.get("wapiti_max_scan_time", 240)
+    _wapiti_max_attack_time  = profile_cfg.get("wapiti_max_attack_time", 60)
+    _wapiti_tasks            = profile_cfg.get("wapiti_tasks", 4)
     _wapiti_depth            = profile_cfg.get("wapiti_depth", 3)
-    _wapiti_timeout          = profile_cfg.get("wapiti_timeout", 5)
-    _wapiti_max_params       = 50 if profile == "deep" else 15
-    _wapiti_max_links        = 50 if profile == "deep" else 20
-    _wapiti_max_files        = 50 if profile == "deep" else 20
-    _container_timeout       = profile_cfg.get("container_timeout_wapiti", 180)
-    _max_origins             = 5  # always cap per-run to prevent runaway scans
+    _wapiti_timeout          = profile_cfg.get("wapiti_timeout", 8)
+    _wapiti_max_params       = profile_cfg.get("wapiti_max_parameters", _default_params)
+    _wapiti_max_links        = profile_cfg.get("wapiti_max_links_per_page", _default_links)
+    _wapiti_max_files        = profile_cfg.get("wapiti_max_files_per_dir", _default_files)
+    _container_timeout       = profile_cfg.get("container_timeout_wapiti", 360)
+    _max_origins             = profile_cfg.get("wapiti_max_origins", _default_origins)
 
     if profile == "deep":
         print(
-            f"[*] بروفايل الفحص العميق (deep) مفعّل — مهلة الحاوية: {_container_timeout}s، "
-            f"عمق الزحف: {_wapiti_depth}، وقت الفحص الأقصى: {_wapiti_max_scan_time}s",
+            f"[*] بروفايل الفحص العميق (deep) مفعّل — الحد الأقصى للأصول: {_max_origins}، "
+            f"التوازي المبدئي: {_wapiti_tasks}، مهلة الأصل: {_wapiti_max_scan_time}s، عمق الزحف: {_wapiti_depth}",
             flush=True
         )
 
@@ -1753,7 +1792,8 @@ def run_wapiti_dast(
         verify_ssl=verify_ssl
     )
     wapiti_plan = joint_plan.get("wapiti_plan") or {}
-    if modules and isinstance(modules, str) and modules.strip():
+    custom_modules_requested = bool(modules and isinstance(modules, str) and modules.strip())
+    if custom_modules_requested:
         enabled_modules = [m.strip() for m in modules.split(",") if m.strip()]
     else:
         enabled_modules = wapiti_plan.get("enabled_modules", [
@@ -1762,7 +1802,29 @@ def run_wapiti_dast(
             "unsecure_password"
         ])
 
-    targets_to_audit = target_origins[:_max_origins]
+    # Layer 1 + Priority/Cluster Dedup: Focus on high-value Canonical Live Origins
+    target_cls = wapiti_plan.get("target_classification") or {}
+    preferred_targets = (
+        target_cls.get("prioritized_preferred_targets")
+        or target_cls.get("canonical_preferred_targets")
+        or target_origins
+    )
+    redundant_redirects = target_cls.get("redundant_redirect_origins") or []
+    cluster_pruned = target_cls.get("cluster_pruned_origins") or []
+    unfollowed_redirects = set(target_cls.get("unfollowed_redirect_origins") or [])
+
+    if redundant_redirects:
+        print(
+            f"[*] [Layer 1 Pre-Scan] استبعاد {len(redundant_redirects)} بوابة إعادة توجيه مكررة من Wapiti لصالح الوجهات القانونية الحية.",
+            flush=True
+        )
+    if cluster_pruned:
+        print(
+            f"[*] [Cluster Dedup] تجميع {len(cluster_pruned)} نطاقات متطابقة هيكلياً لتوفير ميزانية الفحص للأصول الفريدة.",
+            flush=True
+        )
+
+    targets_to_audit = (preferred_targets or target_origins)[:_max_origins]
     combined_raw: Dict[str, Any] = {"vulnerabilities": {}, "anomalies": {}, "infos": {}}
     start_time = time.time()
     total_raw_count = 0
@@ -1797,20 +1859,41 @@ def run_wapiti_dast(
         if evasion_cfg.wapiti_tasks:
             _wapiti_tasks = evasion_cfg.wapiti_tasks
 
+    from core.security_scan_planner import WAPITI_VERIFIED_PASSIVE_MODULES
+    from core.waf_false_positive_filter import WAFCircuitBreaker
+
+    rate_breaker = WAFCircuitBreaker("wapiti_session", threshold=5)
+    adaptive_throttled = False
+    findings_file = os.path.join(session_dir, "wapiti_findings.json")
+
     for idx, target_orig in enumerate(targets_to_audit, start=1):
         if is_scan_cancelled(scan_id):
             raise ScanCancelledException(f"Scan {scan_id} cancelled.")
 
-        print(f"[*] Wapiti DAST [{profile.upper()}]: فحص الهدف {idx}/{len(targets_to_audit)}: {target_orig} (تنفيذ تسلسلي)...", flush=True)
+        # Layer 4: Context-Aware Attack Scope — pure redirect gateways never receive blind active injection
+        is_redirect_only = target_orig in unfollowed_redirects
+        target_modules = list(enabled_modules)
+        if is_redirect_only and not custom_modules_requested:
+            passive_mods = [m for m in enabled_modules if m in WAPITI_VERIFIED_PASSIVE_MODULES]
+            if passive_mods:
+                target_modules = passive_mods
+                print(
+                    f"[*] [Layer 4 Context Scope] الهدف {target_orig} بوابة إعادة توجيه بحتة؛ "
+                    f"تقييد الفحص إلى الوحدات السلبية للترويسات والنقل الآمن دون حقن أعمى.",
+                    flush=True,
+                )
+
+        print(f"[*] Wapiti DAST [{profile.upper()}]: فحص الهدف {idx}/{len(targets_to_audit)}: {target_orig} (التوازي: {_wapiti_tasks})...", flush=True)
 
         raw_filename = f"wapiti_raw_{idx}.json"
         raw_output_path = os.path.join(session_dir, raw_filename)
+        sess_sub_dir = os.path.join(session_dir, f".wapiti_sess_{idx}")
 
         args = [
             "-u", target_orig,
             "--scope", "domain",
-            "-m", ",".join(enabled_modules),
-            "-S", "paranoid",
+            "-m", ",".join(target_modules),
+            "-S", "normal",
             "--tasks", str(_wapiti_tasks),
             "-d", str(_wapiti_depth),
             "--max-scan-time", str(_wapiti_max_scan_time),
@@ -1818,18 +1901,22 @@ def run_wapiti_dast(
             "--max-parameters", str(_wapiti_max_params),
             "--max-links-per-page", str(_wapiti_max_links),
             "--max-files-per-dir", str(_wapiti_max_files),
+            "--store-session", f"/data/.wapiti_sess_{idx}",
+            "--flush-session",
             "-f", "json",
             "-o", f"/data/{raw_filename}",
             "--no-bugreport",
             "-t", str(_wapiti_timeout)
         ]
 
-        if profile == "deep":
+        if is_redirect_only:
+            args.extend(["-l", "1", "-dr", "1", "--no-form-submission"])
+        elif profile == "deep":
             args.extend(["-l", "2", "-dr", "2"])
         else:
             args.extend(["-l", "1", "-dr", "1"])
 
-        if profile == "safe":
+        if profile == "safe" and not is_redirect_only:
             args.append("--no-form-submission")
 
         if verify_ssl:
@@ -1845,7 +1932,7 @@ def run_wapiti_dast(
             if t_spec.get("origin") == target_orig:
                 seeds = [s for s in t_spec.get("seed_urls", []) if is_same_origin(s, target_orig)]
                 break
-        max_seeds = 10 if profile == "deep" else 5
+        max_seeds = 15 if profile == "deep" else 8
         for s in seeds[:max_seeds]:
             args.extend(["-s", s])
 
@@ -1857,6 +1944,14 @@ def run_wapiti_dast(
             scan_id=scan_id,
             extra_hosts=origin_extra_hosts
         )
+
+        # Clean up ephemeral Wapiti SQLite session folder after each origin
+        if os.path.exists(sess_sub_dir):
+            try:
+                import shutil
+                shutil.rmtree(sess_sub_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         executed_any = True
         if success:
@@ -1888,9 +1983,42 @@ def run_wapiti_dast(
                 pass
 
         for f in target_findings:
+            if waf_bypassed:
+                f["waf_bypassed"] = True
+                f["origin_ip"] = origin_ip
+                f["bypassed_origin"] = True
             if not any(x["finding_id"] == f["finding_id"] for x in wapiti_findings):
                 wapiti_findings.append(f)
                 print(f"[{f['severity']}] {f['title']} -> {f['url']}", flush=True)
+
+        # Runtime Circuit Breaker: detect 429 / 503 / rate-limit spikes and step down tasks safely
+        out_low = (output or "").lower()
+        rate_signals = len(re.findall(r"\b(429|too many requests|503|error 1015|connection reset)\b", out_low))
+        if rate_signals >= 3 or "rate limit" in out_low:
+            for _ in range(max(1, rate_signals)):
+                rate_breaker.record_waf_block(provider="HTTP RateLimit/WAF", reason="runtime_429_or_503")
+            if rate_breaker.is_tripped and _wapiti_tasks > 1:
+                _wapiti_tasks = 1
+                _wapiti_timeout = max(int(_wapiti_timeout), 20)
+                adaptive_throttled = True
+                print(
+                    f"[!] [Adaptive Circuit Breaker] رُصدت استجابات حد الطلبات (429/503) على {target_orig}؛ "
+                    f"تخفيض التوازي تلقائياً إلى task=1 وتمديد المهلة إلى {_wapiti_timeout}s لحماية الـ IP.",
+                    flush=True,
+                )
+
+        # Per-Origin Incremental Save: persist accumulated findings after every target completes
+        try:
+            with open(findings_file, "w", encoding="utf-8") as ff:
+                json.dump(wapiti_findings, ff, ensure_ascii=False, indent=2)
+            prog = min(94, 88 + int((idx / max(1, len(targets_to_audit))) * 6))
+            update_status(
+                scan_id,
+                progress=prog,
+                log_message=f"اكتمل فحص Wapiti للأصل {idx}/{len(targets_to_audit)}: {target_orig} ({len(wapiti_findings)} نتيجة تراكمية).",
+            )
+        except Exception:
+            pass
 
     combined_raw_path = os.path.join(session_dir, "wapiti_raw.json")
     with open(combined_raw_path, "w", encoding="utf-8") as cf:
@@ -1913,7 +2041,6 @@ def run_wapiti_dast(
             f["origin_ip"] = origin_ip
             f["bypassed_origin"] = True
 
-    findings_file = os.path.join(session_dir, "wapiti_findings.json")
     with open(findings_file, "w", encoding="utf-8") as ff:
         json.dump(wapiti_findings, ff, ensure_ascii=False, indent=2)
 
@@ -1952,6 +2079,10 @@ def run_wapiti_dast(
         "modules_excluded_review": review_modules,
         "verify_ssl": 1 if verify_ssl else 0,
         "targets_scanned": targets_to_audit,
+        "max_origins_cap": _max_origins,
+        "cluster_pruned_origins": cluster_pruned,
+        "adaptive_throttled": adaptive_throttled,
+        "final_wapiti_tasks": _wapiti_tasks,
         "waf_bypassed": waf_bypassed,
         "origin_ip": origin_ip,
         "resolved_to_origin": bool(origin_extra_hosts),
@@ -2428,8 +2559,12 @@ def unify_and_save_vulnerabilities(
     from core.waf_false_positive_filter import filter_waf_block_false_positives
     combined_raw, suppressed_waf_blocks = filter_waf_block_false_positives(combined_raw)
 
+    # Layer 3: Active Proof-Based Injection Verification Engine
+    from core.injection_verifier import filter_unverified_injection_false_positives
+    combined_raw, suppressed_injections = filter_unverified_injection_false_positives(combined_raw)
+
     triage_file = os.path.join(session_dir, "triage_suppressed.json")
-    if suppressed_fps or canonicalized_count > 0 or suppressed_waf_blocks:
+    if suppressed_fps or canonicalized_count > 0 or suppressed_waf_blocks or suppressed_injections:
         unique_final_urls = sorted(list({item.get("final_url", "") for item in suppressed_fps if item.get("final_url")}))
         dest_hint = f" ({', '.join(unique_final_urls[:3])})" if unique_final_urls else ""
         summary_parts = []
@@ -2445,17 +2580,23 @@ def unify_and_save_vulnerabilities(
             summary_parts.append(
                 f"استبعاد {len(suppressed_waf_blocks)} تنبيهات آلية كاذبة ناتجة عن صفحات حظر جدار الحماية (WAF Block Pages)"
             )
+        if suppressed_injections:
+            summary_parts.append(
+                f"التحقق النشط بالبرهان واستبعاد {len(suppressed_injections)} تنبيه حقن كاذب (نقاط إعادة توجيه 301/308 أو تطابق بنية DOM لصفحات SPA/ثابتة)"
+            )
 
         triage_summary_ar = "تم التحقق الشبكي المباشر و" + "، و".join(summary_parts) + "."
 
         triage_payload = {
-            "suppressed_count": len(suppressed_fps) + len(suppressed_waf_blocks),
+            "suppressed_count": len(suppressed_fps) + len(suppressed_waf_blocks) + len(suppressed_injections),
             "redirect_suppressed_count": len(suppressed_fps),
             "waf_block_suppressed_count": len(suppressed_waf_blocks),
+            "injection_suppressed_count": len(suppressed_injections),
             "canonicalized_count": canonicalized_count,
             "summary_ar": triage_summary_ar,
-            "suppressed_items": suppressed_fps,
+            "suppressed_items": suppressed_fps + suppressed_injections,
             "waf_suppressed_items": suppressed_waf_blocks,
+            "injection_suppressed_items": suppressed_injections,
         }
         try:
             with open(triage_file, "w", encoding="utf-8") as tf:

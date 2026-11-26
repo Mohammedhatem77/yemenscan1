@@ -248,6 +248,39 @@ def celery_run_standalone_tool(
 # Smart Dispatcher (Celery with graceful BackgroundTasks fallback)
 # ---------------------------------------------------------------------------
 
+def _compute_dynamic_celery_limits(
+    profile_cfg: Dict[str, Any],
+    session_dir: Optional[str] = None,
+) -> tuple[int, int]:
+    """
+    Computes adaptive Celery (soft_time_limit, time_limit) scaled proportionally
+    to discovered or allowed origin counts while preserving matrix minimums.
+    """
+    base_soft = int(profile_cfg.get("celery_soft_time_limit", 2400))
+    base_hard = int(profile_cfg.get("celery_time_limit", 3000))
+    max_origins = int(profile_cfg.get("wapiti_max_origins", 10))
+    per_origin_scan = int(profile_cfg.get("wapiti_max_scan_time", 240))
+
+    origin_count = max_origins
+    if session_dir:
+        active_txt = os.path.join(session_dir, "active_urls.txt")
+        if os.path.exists(active_txt):
+            try:
+                with open(active_txt, "r", encoding="utf-8", errors="replace") as af:
+                    lines = [l.strip() for l in af if l.strip()]
+                if lines:
+                    from urllib.parse import urlparse
+                    uniq = {f"{urlparse(u).scheme}://{urlparse(u).netloc}" for u in lines if "://" in u}
+                    origin_count = min(max_origins, max(1, len(uniq)))
+            except Exception:
+                pass
+
+    # Allocate headroom for Stage 1/2 + Nuclei + Wapiti per-origin budget (capped at 6 hours)
+    scaled_soft = min(21600, max(base_soft, origin_count * per_origin_scan + 1800))
+    scaled_hard = min(23400, max(base_hard, scaled_soft + 900))
+    return scaled_soft, scaled_hard
+
+
 def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe", background_tasks=None, resume: bool = False) -> str:
     """
     Dispatches full scan to Celery worker if Redis is reachable;
@@ -263,8 +296,12 @@ def dispatch_scan_pipeline(domain: str, scan_id: str, scan_profile: str = "safe"
     from core.security_scan_planner import SecurityScanPlanner
     planner = SecurityScanPlanner()
     profile_cfg = planner.get_profile_config(scan_profile)
-    soft_tl = profile_cfg.get("celery_soft_time_limit", 1800)
-    hard_tl = profile_cfg.get("celery_time_limit", 2400)
+    sess_dir = None
+    try:
+        sess_dir = get_session_dir(scan_id)
+    except Exception:
+        sess_dir = None
+    soft_tl, hard_tl = _compute_dynamic_celery_limits(profile_cfg, session_dir=sess_dir)
 
     if is_celery_broker_reachable():
         try:
@@ -333,8 +370,12 @@ def dispatch_stage3(scan_id: str, scan_profile: str = "safe", background_tasks=N
     from core.security_scan_planner import SecurityScanPlanner
     planner = SecurityScanPlanner()
     profile_cfg = planner.get_profile_config(scan_profile)
-    soft_tl = profile_cfg.get("celery_soft_time_limit", 1800)
-    hard_tl = profile_cfg.get("celery_time_limit", 2400)
+    sess_dir = None
+    try:
+        sess_dir = get_session_dir(scan_id)
+    except Exception:
+        sess_dir = None
+    soft_tl, hard_tl = _compute_dynamic_celery_limits(profile_cfg, session_dir=sess_dir)
 
     if is_celery_broker_reachable():
         try:
