@@ -10,10 +10,10 @@ from core.session import get_session_dir, get_status, update_status, SCANS_DIR
 from core.runner import is_docker_available, run_docker_tool, run_local_tool
 from core.stage1_discovery import run_subfinder, run_naabu
 from core.stage2_web_probing import run_httpx, run_kiterunner_or_api_probing
+from core.nuclei_standalone import run_standalone_nuclei as _run_standalone_nuclei_backend
 from core.stage3_vulnerabilities import (
     prepare_nuclei_targets,
     run_nuclei,
-    run_standalone_nuclei as _run_standalone_nuclei_backend,
     run_wapiti_dast,
     unify_and_save_vulnerabilities,
     NUCLEI_DOCKER_IMAGE,
