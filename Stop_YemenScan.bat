@@ -14,8 +14,8 @@ for /f "tokens=5" %%a in ('netstat -aon ^| findstr :8000 ^| findstr LISTENING') 
     taskkill /F /T /PID %%a >nul 2>&1
 )
 
-:: 2. Stop Docker Containers cleanly
-echo [*] [2/2] Stopping PostgreSQL container in Docker...
+:: 2. Stop Docker Containers cleanly (db, redis, worker)
+echo [*] [2/2] Stopping Docker containers...
 docker compose down >nul 2>&1
 
 echo.
