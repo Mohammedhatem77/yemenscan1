@@ -5,111 +5,269 @@ from urllib.parse import urlsplit, urljoin
 from typing import Dict, Any, List, Optional, Tuple
 
 # Comprehensive database of prominent SaaS, Cloud, CDN, and LMS signatures
+# scope_policy values:
+#   - "third_party_saas" : Independent external vendor service (strict Zero-Touch)
+#   - "cloud_cdn"        : CDN / Reverse Proxy serving first-party app traffic (In-Scope)
+#   - "cloud_paas"       : First-party cloud / PaaS web app hosting (In-Scope)
 KNOWN_PROVIDERS = [
-    # Google Ecosystem
+    # --- Strict Third-Party SaaS (Zero-Touch) ---
     {
-        "name": "Google Workspace / GCP",
-        "cname_regex": [r"\.googlehosted\.com$", r"\.ghs\.google\.com$", r"\.google\.com$", r"\.1e100\.net$"],
+        "name": "Google Workspace / SaaS",
+        "scope_policy": "third_party_saas",
+        "cname_regex": [r"\.googlehosted\.com$", r"\.ghs\.google\.com$", r"\.ghs\.googlehosted\.com$", r"\.google\.com$", r"\.1e100\.net$"],
         "asn_regex": [r"\bGOOGLE\b"]
     },
-    # Microsoft Ecosystem
     {
-        "name": "Microsoft 365 / Azure",
+        "name": "Microsoft 365 SaaS",
+        "scope_policy": "third_party_saas",
         "cname_regex": [
-            r"\.azurewebsites\.net$",
-            r"\.cloudapp\.net$",
-            r"\.trafficmanager\.net$",
             r"\.office365\.com$",
             r"\.outlook\.com$",
             r"\.sharepoint\.com$",
             r"\.microsoftonline\.com$",
-            r"\.msecnd\.net$",
-            r"\.azureedge\.net$"
+            r"\.lync\.com$"
         ],
-        "asn_regex": [r"\bMICROSOFT\b"]
+        "asn_regex": []
     },
-    # Amazon AWS
-    {
-        "name": "Amazon AWS / CloudFront",
-        "cname_regex": [
-            r"\.amazonaws\.com$",
-            r"\.cloudfront\.net$",
-            r"\.elasticbeanstalk\.com$",
-            r"\.awsglobalaccelerator\.com$"
-        ],
-        "asn_regex": [r"\bAMAZON\b"]
-    },
-    # Cloudflare CDN & Security
-    {
-        "name": "Cloudflare CDN & Security",
-        "cname_regex": [r"\.cloudflare\.net$", r"\.cloudflare\.com$"],
-        "asn_regex": [r"\bCLOUDFLARE\b"]
-    },
-    # Educational & Learning Management Systems (LMS)
     {
         "name": "MoodleCloud LMS",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.moodlecloud\.com$", r"\.moodle\.com$"],
         "asn_regex": []
     },
     {
         "name": "Canvas LMS (Instructure)",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.instructure\.com$"],
         "asn_regex": []
     },
     {
         "name": "Blackboard Learn",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.blackboard\.com$"],
         "asn_regex": []
     },
-    # Modern Web & Developer Platforms
-    {
-        "name": "GitHub Pages",
-        "cname_regex": [r"\.github\.io$", r"\.githubusercontent\.com$"],
-        "asn_regex": []
-    },
-    {
-        "name": "Vercel",
-        "cname_regex": [r"\.vercel\.app$", r"\.vercel-dns\.com$"],
-        "asn_regex": []
-    },
-    {
-        "name": "Netlify",
-        "cname_regex": [r"\.netlify\.app$", r"\.netlify\.com$"],
-        "asn_regex": []
-    },
-    {
-        "name": "Heroku",
-        "cname_regex": [r"\.herokuapp\.com$"],
-        "asn_regex": []
-    },
-    # Helpdesk & CRM
     {
         "name": "Zendesk",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.zendesk\.com$"],
         "asn_regex": []
     },
     {
         "name": "Freshdesk",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.freshdesk\.com$"],
         "asn_regex": []
     },
     {
         "name": "Salesforce",
+        "scope_policy": "third_party_saas",
         "cname_regex": [r"\.force\.com$", r"\.salesforce\.com$"],
         "asn_regex": []
     },
-    # Content Delivery Networks (CDNs)
+    {
+        "name": "Atlassian / Statuspage SaaS",
+        "scope_policy": "third_party_saas",
+        "cname_regex": [r"\.atlassian\.net$", r"\.statuspage\.io$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Marketing / Support / Docs SaaS",
+        "scope_policy": "third_party_saas",
+        "cname_regex": [
+            r"\.hubspot\.net$",
+            r"\.hs-sites\.com$",
+            r"\.marketo\.com$",
+            r"\.mktoweb\.com$",
+            r"\.mailchimp\.com$",
+            r"\.intercom\.help$",
+            r"\.helpscoutdocs\.com$",
+            r"\.readme\.io$"
+        ],
+        "asn_regex": []
+    },
+    {
+        "name": "Hosted Storefront / Builder SaaS",
+        "scope_policy": "third_party_saas",
+        "cname_regex": [
+            r"\.myshopify\.com$",
+            r"\.shopify\.com$",
+            r"\.webflow\.io$",
+            r"\.proxy\.webflow\.com$",
+            r"\.wixsite\.com$",
+            r"\.wixdns\.net$",
+            r"\.squarespace\.com$",
+            r"\.squarespace-dns\.com$"
+        ],
+        "asn_regex": []
+    },
+    {
+        "name": "External Hosting Portal / Mail Redirector",
+        "scope_policy": "third_party_saas",
+        "cname_regex": [
+            r"^mail-redirect\.turbify\.com$",
+            r"\.turbifyprimary\.biz$",
+            r"\.cprapid\.com$"
+        ],
+        "asn_regex": []
+    },
+
+    # --- Cloud CDN & Reverse Proxy (In-Scope First-Party Traffic) ---
+    {
+        "name": "Cloudflare CDN & Security",
+        "scope_policy": "cloud_cdn",
+        "cname_regex": [r"\.cloudflare\.net$", r"\.cloudflare\.com$", r"\.cloudflare-dns\.com$"],
+        "asn_regex": [r"\bCLOUDFLARE\b"]
+    },
+    {
+        "name": "Amazon CloudFront CDN",
+        "scope_policy": "cloud_cdn",
+        "cname_regex": [r"\.cloudfront\.net$", r"\.awsglobalaccelerator\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Microsoft Azure CDN / Edge",
+        "scope_policy": "cloud_cdn",
+        "cname_regex": [r"\.azureedge\.net$", r"\.azurefd\.net$", r"\.msecnd\.net$", r"\.trafficmanager\.net$"],
+        "asn_regex": []
+    },
     {
         "name": "Akamai CDN",
-        "cname_regex": [r"\.akamai\.net$", r"\.akamaiedge\.net$", r"\.akamaihd\.net$"],
+        "scope_policy": "cloud_cdn",
+        "cname_regex": [r"\.akamai\.net$", r"\.akamaiedge\.net$", r"\.akamaihd\.net$", r"\.edgekey\.net$", r"\.edgesuite\.net$"],
         "asn_regex": [r"\bAKAMAI\b"]
     },
     {
         "name": "Fastly CDN",
+        "scope_policy": "cloud_cdn",
         "cname_regex": [r"\.fastly\.net$", r"\.fastlylb\.net$"],
         "asn_regex": [r"\bFASTLY\b"]
+    },
+    {
+        "name": "Bunny / Imperva / Sucuri CDN",
+        "scope_policy": "cloud_cdn",
+        "cname_regex": [r"\.b-cdn\.net$", r"\.incapdns\.net$", r"\.impervadns\.net$", r"\.sucuri\.net$"],
+        "asn_regex": []
+    },
+
+    # --- First-Party Cloud / PaaS App Hosting (In-Scope Web Apps) ---
+    {
+        "name": "Vercel",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.vercel\.app$", r"\.vercel-dns\.com$", r"\.vercel-dns-\d+\.com$", r"^cname\.vercel-dns\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Netlify",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.netlify\.app$", r"\.netlify\.com$", r"\.netlifyglobalcdn\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Cloudflare Pages / Workers",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.pages\.dev$", r"\.workers\.dev$"],
+        "asn_regex": []
+    },
+    {
+        "name": "GitHub Pages",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.github\.io$", r"\.githubusercontent\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Heroku",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.herokuapp\.com$", r"\.herokudns\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Modern PaaS (Render / Fly / Railway / DO)",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.onrender\.com$", r"\.fly\.dev$", r"\.up\.railway\.app$", r"\.ondigitalocean\.app$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Google Cloud Run / Firebase Hosting",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.a\.run\.app$", r"\.run\.app$", r"\.web\.app$", r"\.firebaseapp\.com$"],
+        "asn_regex": []
+    },
+    {
+        "name": "Microsoft Azure App Hosting",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.azurewebsites\.net$", r"\.cloudapp\.net$", r"\.azurecontainerapps\.io$"],
+        "asn_regex": [r"\bMICROSOFT\b"]
+    },
+    {
+        "name": "Amazon AWS Hosting",
+        "scope_policy": "cloud_paas",
+        "cname_regex": [r"\.amazonaws\.com$", r"\.elasticbeanstalk\.com$", r"\.awsapprunner\.com$"],
+        "asn_regex": [r"\bAMAZON\b"]
     }
 ]
+
+_HOSTING_PANEL_PREFIXES = {
+    "cpanel", "whm", "webmail", "webdisk",
+    "cpcalendars", "cpcalendarss", "cpcontacts", "autodiscover"
+}
+
+def _is_hosting_panel_host(clean_host: str, clean_root: str) -> bool:
+    """Returns True if clean_host is an administrative cPanel/mail helper subdomain."""
+    if not clean_host or not clean_root or clean_host == clean_root:
+        return False
+    suffix = "." + clean_root
+    if not clean_host.endswith(suffix):
+        return False
+    sub_part = clean_host[:-len(suffix)]
+    labels = [lbl for lbl in sub_part.split(".") if lbl]
+    return any(lbl in _HOSTING_PANEL_PREFIXES for lbl in labels)
+
+def _match_cname_provider(cname_value: str) -> Tuple[Optional[str], Optional[str]]:
+    """Matches an external CNAME against KNOWN_PROVIDERS and returns (name, scope_policy)."""
+    for prov in KNOWN_PROVIDERS:
+        for pat in prov.get("cname_regex", []):
+            if re.search(pat, cname_value, re.IGNORECASE):
+                return prov["name"], prov.get("scope_policy", "third_party_saas")
+    return None, None
+
+def _san_covers_domain(sans: List[str], domain: str) -> bool:
+    """Checks if a normalized TLS SAN list covers domain either verbatim or via single-level wildcard."""
+    if not domain or not sans:
+        return False
+    if domain in sans:
+        return True
+    if "." in domain:
+        parent = domain.split(".", 1)[1]
+        if f"*.{parent}" in sans:
+            return True
+    return False
+
+def _is_verified_shared_hosting(
+    clean_host: str,
+    clean_root: str,
+    tls_info: Optional[Dict[str, Any]]
+) -> bool:
+    """
+    Conservative ownership proof for unknown external CNAMEs:
+    Allows in-scope scanning ONLY when the host is not a hosting panel subdomain and
+    presents a valid, non-expired, non-mismatched TLS certificate whose SAN list covers
+    BOTH the root domain and the probed host (shared domain-owner provisioning).
+    """
+    if not clean_host or not clean_root or not isinstance(tls_info, dict):
+        return False
+    if _is_hosting_panel_host(clean_host, clean_root):
+        return False
+    if tls_info.get("probe_status") is False:
+        return False
+    if tls_info.get("expired") or tls_info.get("self_signed") or tls_info.get("mismatched"):
+        return False
+
+    raw_sans = tls_info.get("subject_an")
+    if not isinstance(raw_sans, list) or not raw_sans:
+        return False
+    sans = [str(s).strip().lower().rstrip(".") for s in raw_sans if s and str(s).strip()]
+    return _san_covers_domain(sans, clean_root) and _san_covers_domain(sans, clean_host)
 
 def clean_domain(domain_str: str) -> str:
     """Extracts a normalized, lowercase host without protocols, ports, or paths."""
@@ -140,10 +298,11 @@ def classify_scope(
     cdn_name: Optional[str] = None,
     status_code: Optional[int] = None,
     location: Optional[str] = None,
-    origin_ip: Optional[str] = None
+    origin_ip: Optional[str] = None,
+    tls_info: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     """
-    Intelligently classifies an asset into Self-Hosted vs Third-Party SaaS / CDN,
+    Intelligently classifies an asset into Self-Hosted vs Third-Party SaaS / CDN / PaaS,
     and analyzes HTTP redirection dynamics for Scope Guarding in DAST testing.
     """
     clean_root = clean_domain(root_domain)
@@ -179,7 +338,7 @@ def classify_scope(
             redirect_type = "internal"
 
     # -------------------------------------------------------------------------
-    # 2. Third-Party / SaaS & Hosting Classification (Two-Tier)
+    # 2. Policy-Aware Hosting & Third-Party SaaS Classification
     # -------------------------------------------------------------------------
     is_third_party = False
     provider_name = "Self-Hosted (Local / On-Premise)"
@@ -193,33 +352,52 @@ def classify_scope(
         provider_name = "Self-Hosted Backend (Origin Server)"
         hosting_type = "self_hosted_origin"
     else:
-        # Tier 1 & 2: CNAME Inspection
-        for c in cnames:
-            if not is_domain_matching_root(c, clean_root):
-                is_third_party = True
-                external_cname_target = c
-                hosting_type = "third_party_saas"
-                
-                # Check known signatures for a friendly brand name
-                matched_brand = None
-                for prov in KNOWN_PROVIDERS:
-                    for pat in prov["cname_regex"]:
-                        if re.search(pat, c, re.IGNORECASE):
-                            matched_brand = prov["name"]
-                            break
-                    if matched_brand:
-                        break
-                
-                if matched_brand:
-                    provider_name = matched_brand
-                else:
-                    provider_name = f"External Third-Party ({c})"
-                break
+        external_cnames = [c for c in cnames if not is_domain_matching_root(c, clean_root)]
 
-        # If CNAME didn't flag, check CDN & ASN signals
-        if not is_third_party:
+        if external_cnames:
+            matched_saas: Optional[Tuple[str, str]] = None
+            matched_cdn: Optional[Tuple[str, str]] = None
+            matched_paas: Optional[Tuple[str, str]] = None
+
+            for ext_c in external_cnames:
+                pname, policy = _match_cname_provider(ext_c)
+                if policy == "third_party_saas" and matched_saas is None:
+                    matched_saas = (pname, ext_c)
+                elif policy == "cloud_cdn" and matched_cdn is None:
+                    matched_cdn = (pname, ext_c)
+                elif policy == "cloud_paas" and matched_paas is None:
+                    matched_paas = (pname, ext_c)
+
+            if matched_saas is not None:
+                # Strict Zero-Touch: real third-party SaaS wins even if cdn_name is also set
+                is_third_party = True
+                hosting_type = "third_party_saas"
+                provider_name = matched_saas[0]
+                external_cname_target = matched_saas[1]
+            elif matched_cdn is not None:
+                is_third_party = False
+                hosting_type = "cloud_cdn"
+                provider_name = f"Cloud CDN ({matched_cdn[0]})"
+                external_cname_target = matched_cdn[1]
+            elif matched_paas is not None:
+                is_third_party = False
+                hosting_type = "cloud_paas"
+                provider_name = f"Cloud App Hosting ({matched_paas[0]})"
+                external_cname_target = matched_paas[1]
+            else:
+                first_ext = external_cnames[0]
+                external_cname_target = first_ext
+                if _is_verified_shared_hosting(clean_h, clean_root, tls_info):
+                    is_third_party = False
+                    hosting_type = "shared_hosting"
+                    provider_name = f"Shared Hosting ({first_ext})"
+                else:
+                    is_third_party = True
+                    hosting_type = "third_party_saas"
+                    provider_name = f"External Third-Party ({first_ext})"
+        else:
+            # No external CNAMEs: evaluate CDN or cloud ASN signals
             if cdn:
-                # CDN Detected (e.g. cloudflare, google, akamai, etc.) — reverse proxy/cache for target
                 is_third_party = False
                 hosting_type = "cloud_cdn"
                 provider_name = f"Cloud CDN ({cdn.title()})"
@@ -227,7 +405,6 @@ def classify_scope(
                 for prov in KNOWN_PROVIDERS:
                     for asn_pat in prov["asn_regex"]:
                         if re.search(asn_pat, as_name, re.IGNORECASE):
-                            # Cloud ASN without external CNAME (could be self-hosted on AWS/GCP EC2)
                             hosting_type = "cloud_hosted"
                             provider_name = f"{prov['name']} (Infrastructure)"
                             break
@@ -305,6 +482,22 @@ def build_scope_badge(
             "dast_allowed": True,
             "takeover_checked": False,
             "description": f"أصل داخلي محمي عبر ({prov}) - مسموح فحص DAST الكامل"
+        }
+    elif hosting_type == "cloud_paas":
+        return {
+            "label": f"{prov}",
+            "color": "green",
+            "dast_allowed": True,
+            "takeover_checked": False,
+            "description": f"تطبيق ويب تابع للجهة المستهدفة مستضاف سحابياً ({prov}) - مسموح فحص DAST الكامل"
+        }
+    elif hosting_type == "shared_hosting":
+        return {
+            "label": f"In-Scope ({prov})",
+            "color": "green",
+            "dast_allowed": True,
+            "takeover_checked": False,
+            "description": f"أصل داخلي متطابق الشهادة ومستضاف لدى ({prov}) - مسموح فحص DAST الكامل"
         }
     else:
         return {

@@ -2,8 +2,12 @@ import os
 import json
 import time
 import re
+import ssl
+import secrets
 import shutil
 import hashlib
+import urllib.request
+import urllib.error
 from urllib.parse import urlsplit
 from typing import List, Dict, Any, Tuple, Optional, Set
 import requests
@@ -444,6 +448,7 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         cdn_val = bool(data.get("cdn"))
         cdn_name_val = str(data.get("cdn_name") or "").strip()
         location_val = data.get("location") or None
+        tls_val = data.get("tls")
 
         scope_info = classify_scope(
             url=norm_url,
@@ -454,7 +459,8 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
             cdn_name=cdn_name_val,
             status_code=status_code,
             location=location_val,
-            origin_ip=origin_ip
+            origin_ip=origin_ip,
+            tls_info=tls_val if isinstance(tls_val, dict) else None
         )
 
         is_orig_target = bool(origin_ip and (host == origin_ip or str(data.get("input", "")).startswith(f"{origin_ip}:")))
@@ -463,7 +469,6 @@ def run_httpx(session_dir: str, scan_id: str) -> Tuple[bool, List[Dict[str, Any]
         if favicon_val is not None:
             favicon_val = str(favicon_val).strip()
         favicon_url_val = data.get("favicon_url")
-        tls_val = data.get("tls")
         method_val = data.get("method")
         final_url_val = data.get("final_url")
         chain_codes_val = data.get("chain_status_codes")
@@ -644,16 +649,266 @@ def normalize_endpoint_url(raw_url: str) -> Optional[Tuple[str, str, Tuple[str, 
     except Exception:
         return None
 
+_PRESERVED_REAL_API_HINTS = (
+    "/wp-json",
+    "/graphql",
+    "/graphiql",
+    "/swagger",
+    "/openapi",
+    "/api-docs",
+    "/v2/api-docs",
+    "/actuator/health",
+    "/actuator/info",
+)
+
+_CHALLENGE_BODY_MARKERS = (
+    "one moment, please",
+    "just a moment",
+    "checking your browser",
+    "cf-browser-verification",
+    "__cf_chl_",
+    "enable javascript and cookies",
+    "ddos-guard",
+    "attention required!",
+)
+
+
+def _is_preserved_api_path(path_str: str) -> bool:
+    p_low = (path_str or "").lower()
+    return any(hint in p_low for hint in _PRESERVED_REAL_API_HINTS)
+
+
+def _dedup_followed_http_redirects(
+    targets: List[str],
+    active_recs: Optional[List[Dict[str, Any]]],
+) -> List[str]:
+    """
+    Eliminates http:// origins that HTTPX (-fhr) already observed redirecting onto
+    an https:// target on the same host when the https:// origin is present in targets.
+    """
+    if not targets or not active_recs or len(targets) <= 1:
+        return targets
+
+    target_set = {t.rstrip("/") for t in targets}
+    recs_by_url: Dict[str, Dict[str, Any]] = {}
+    for rec in active_recs:
+        if isinstance(rec, dict) and rec.get("url"):
+            recs_by_url[str(rec["url"]).strip().rstrip("/")] = rec
+
+    kept: List[str] = []
+    for u in targets:
+        p = urlsplit(u)
+        if (p.scheme or "").lower() == "http":
+            rec = recs_by_url.get(u.rstrip("/")) or {}
+            final_u = str(rec.get("final_url") or rec.get("redirect_url") or rec.get("location") or "").strip().rstrip("/")
+            chain = rec.get("chain_status_codes") or []
+            started_with_redirect = (
+                isinstance(chain, list) and len(chain) >= 2 and chain[0] in (301, 302, 303, 307, 308)
+            )
+            if final_u.startswith("https://"):
+                fp = urlsplit(final_u)
+                cand_https = f"https://{fp.netloc}".rstrip("/")
+                if (fp.hostname or "").lower() == (p.hostname or "").lower() and cand_https in target_set:
+                    continue
+            if started_with_redirect:
+                cand_https_same = f"https://{p.hostname}".rstrip("/")
+                if cand_https_same in target_set:
+                    continue
+        kept.append(u)
+
+    return kept or targets
+
+
+def _find_fuzzy_cluster_indices(
+    eps: List[Dict[str, Any]],
+) -> Tuple[Set[int], Set[int]]:
+    """
+    Detects dynamic-token Anti-Bot / Soft-404 wildcard clusters where content_length
+    jitters slightly across >= 8 diverse endpoints of length >= 300 bytes on the same
+    (origin, status_code), as well as reflected-path Soft-404 responses whose length
+    shifts strictly by len(path).
+
+    Returns:
+        (drop_indices, canary_suspect_indices)
+    """
+    drop_indices: Set[int] = set()
+    canary_suspects: Set[int] = set()
+    if len(eps) < 8:
+        return drop_indices, canary_suspects
+
+    by_status: Dict[int, List[Tuple[int, int, str]]] = {}
+    for idx, ep in enumerate(eps):
+        clen = ep.get("content_length")
+        sc = ep.get("status_code")
+        path = (ep.get("path") or "").strip()
+        if isinstance(clen, int) and clen >= 300 and isinstance(sc, int):
+            by_status.setdefault(sc, []).append((idx, clen, path))
+
+    for sc, items in by_status.items():
+        if len(items) < 8:
+            continue
+
+        # 1. Tolerance-window clustering on raw content_length
+        items_sorted = sorted(items, key=lambda x: x[1])
+        n = len(items_sorted)
+        best_blocks: List[List[Tuple[int, int, str]]] = []
+        i = 0
+        while i < n:
+            base_len = items_sorted[i][1]
+            # Tighter tolerance for compact 300-1499B responses so real distinct JSON endpoints survive
+            if base_len >= 1500:
+                tol = max(160, int(0.025 * base_len))
+            else:
+                tol = max(80, int(0.02 * base_len))
+            j = i
+            while j + 1 < n and (items_sorted[j + 1][1] - base_len) <= tol:
+                j += 1
+            block = items_sorted[i : j + 1]
+            distinct_paths = {b[2] for b in block}
+            if len(block) >= 8 and len(distinct_paths) >= 8:
+                best_blocks.append(block)
+                i = j + 1
+            else:
+                i += 1
+
+        for block in best_blocks:
+            for idx, _, path in block:
+                canary_suspects.add(idx)
+                if not _is_preserved_api_path(path):
+                    drop_indices.add(idx)
+
+        # 2. Normalized-length clustering for Reflected-Path Soft-404 pages
+        norm_sorted = sorted(items, key=lambda x: max(0, x[1] - len(x[2])))
+        k = 0
+        while k < len(norm_sorted):
+            base_adj = max(0, norm_sorted[k][1] - len(norm_sorted[k][2]))
+            m = k
+            while m + 1 < len(norm_sorted) and (max(0, norm_sorted[m + 1][1] - len(norm_sorted[m + 1][2])) - base_adj) <= 80:
+                m += 1
+            block = norm_sorted[k : m + 1]
+            distinct_paths = {b[2] for b in block}
+            distinct_raw_lens = {b[1] for b in block}
+            if len(block) >= 8 and len(distinct_paths) >= 8 and len(distinct_raw_lens) >= 3:
+                for idx, _, path in block:
+                    canary_suspects.add(idx)
+                    if not _is_preserved_api_path(path):
+                        drop_indices.add(idx)
+                k = m + 1
+            else:
+                k += 1
+
+    return drop_indices, canary_suspects
+
+
+def _check_origin_negative_canary_baseline(
+    origin: str,
+    candidate_status_codes: Set[int],
+    len_bounds_by_sc: Dict[int, Tuple[int, int]],
+) -> Dict[str, Any]:
+    """
+    Sends ONE SSRF-validated GET request to an impossible random canary path to prove
+    whether an origin's API candidates are generated by an Anti-Bot JS Challenge or
+    Dynamic Soft-404 Wildcard gateway. Safe offline: any DNS/socket failure returns
+    confirmed_spurious=False without impacting callers.
+    """
+    result = {
+        "confirmed_spurious": False,
+        "is_challenge": False,
+        "is_wildcard": False,
+        "status_code": None,
+        "body_length": None,
+        "matched_status_codes": set(),
+    }
+    try:
+        parsed = urlsplit(origin)
+        host = (parsed.hostname or "").strip().lower()
+        scheme = (parsed.scheme or "").lower()
+        if not host or scheme not in ("http", "https"):
+            return result
+
+        from core.target_validator import is_safe_host_or_ip
+        is_safe, _ = is_safe_host_or_ip(host)
+        if not is_safe:
+            return result
+
+        canary_url = f"{origin.rstrip('/')}/__ys_api_canary_{secrets.token_hex(6)}__"
+        req = urllib.request.Request(
+            canary_url,
+            method="GET",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/json,*/*;q=0.8",
+            },
+        )
+        ctx = ssl._create_unverified_context()
+        sc = None
+        body_bytes = b""
+        hdr_len: Optional[int] = None
+        try:
+            with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+                sc = getattr(resp, "status", None) or resp.getcode()
+                body_bytes = resp.read(32768) or b""
+                cl_hdr = resp.headers.get("Content-Length") if resp.headers else None
+                if cl_hdr and str(cl_hdr).isdigit():
+                    hdr_len = int(cl_hdr)
+        except urllib.error.HTTPError as herr:
+            sc = herr.code
+            try:
+                body_bytes = herr.read(32768) or b""
+            except Exception:
+                body_bytes = b""
+            try:
+                cl_hdr = herr.headers.get("Content-Length") if herr.headers else None
+                if cl_hdr and str(cl_hdr).isdigit():
+                    hdr_len = int(cl_hdr)
+            except Exception:
+                pass
+        except Exception:
+            return result
+
+        if not isinstance(sc, int):
+            return result
+
+        resp_len = hdr_len if hdr_len is not None else len(body_bytes)
+        body_low = body_bytes.decode("utf-8", errors="ignore").lower()
+        result["status_code"] = sc
+        result["body_length"] = resp_len
+
+        is_challenge = any(marker in body_low for marker in _CHALLENGE_BODY_MARKERS)
+        is_wildcard = False
+        if sc in candidate_status_codes:
+            min_l, max_l = len_bounds_by_sc.get(sc, (0, 0))
+            lo = max(0, min_l - max(400, int(0.08 * min_l)))
+            hi = max_l + max(400, int(0.08 * max_l))
+            if lo <= resp_len <= hi:
+                is_wildcard = True
+
+        if is_challenge or is_wildcard:
+            result["confirmed_spurious"] = True
+            result["is_challenge"] = is_challenge
+            result["is_wildcard"] = is_wildcard
+            if sc in candidate_status_codes:
+                result["matched_status_codes"] = {sc}
+            elif is_challenge:
+                result["matched_status_codes"] = set(candidate_status_codes)
+    except Exception:
+        return result
+
+    return result
+
+
 def filter_spurious_api_endpoints(
-    valid_endpoints: List[Dict[str, Any]]
+    valid_endpoints: List[Dict[str, Any]],
+    confirmed_canary_origins: Optional[Dict[Tuple[str, int], str]] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Dict[str, Any]]:
     """
     Heuristically analyzes and purifies discovered Kiterunner API candidate endpoints:
-    1. Filters out root paths (path == '/' or empty) which are homepage/hosting defaults (cPanel default landing pages).
-    2. Clusters responses per Origin to detect SPA Wildcard / Soft-404 Fallback behavior (e.g. Vercel/Firebase/React returning identical length for hundreds of paths).
+    1. Filters out root paths (path == '/' or empty) which are homepage/hosting defaults.
+    2. Clusters responses per Origin to detect both exact-length SPA Fallbacks AND
+       dynamic-token Anti-Bot / Soft-404 Challenge clusters (fuzzy length tolerance).
     3. Filters out mass generic redirects (HTTP 308/301) lacking API payloads.
-    4. Automatically determines human-readable technical diagnostics (diagnostic_reason) explaining why zero endpoints were found when filtered.
-    
+    4. Applies optional Canary baseline confirmations for smaller/challenge buckets.
+
     Returns:
         (filtered_endpoints, diagnostic_reason, filter_stats)
     """
@@ -662,6 +917,8 @@ def filter_spurious_api_endpoints(
             "initial_count": 0,
             "root_path_filtered": 0,
             "wildcard_filtered": 0,
+            "fuzzy_wildcard_filtered": 0,
+            "canary_filtered": 0,
             "redirect_filtered": 0,
             "kept_count": 0
         }
@@ -670,6 +927,8 @@ def filter_spurious_api_endpoints(
     root_filtered = 0
     redirect_filtered = 0
     wildcard_filtered = 0
+    fuzzy_wildcard_filtered = 0
+    canary_filtered = 0
     non_root_candidates: List[Dict[str, Any]] = []
 
     # 1. First pass: Filter root path entries (path == '/' or empty)
@@ -687,11 +946,13 @@ def filter_spurious_api_endpoints(
             "initial_count": len(valid_endpoints),
             "root_path_filtered": root_filtered,
             "wildcard_filtered": 0,
+            "fuzzy_wildcard_filtered": 0,
+            "canary_filtered": 0,
             "redirect_filtered": 0,
             "kept_count": 0
         }
 
-    # 2. Second pass: Group non-root candidates by origin to detect Wildcard / SPA Fallback clusters
+    # 2. Second pass: Group non-root candidates by origin
     origin_groups: Dict[str, List[Dict[str, Any]]] = {}
     for ep in non_root_candidates:
         orig = ep.get("origin") or "default"
@@ -699,39 +960,56 @@ def filter_spurious_api_endpoints(
 
     final_kept: List[Dict[str, Any]] = []
     spa_detected = False
+    challenge_detected = False
     redirect_detected = False
+    canary_map = confirmed_canary_origins or {}
 
     for orig, eps in origin_groups.items():
         total_for_orig = len(eps)
-        
-        # If an origin has >= 8 candidate endpoints, detect uniform response clusters
+        exact_wildcard_keys: Set[Tuple[Any, Any]] = set()
+        mass_redirect: Set[Any] = set()
+        fuzzy_drop_indices: Set[int] = set()
+
         if total_for_orig >= 8:
             cluster_counts = Counter((e.get("content_length"), e.get("status_code")) for e in eps)
-            # Any cluster appearing >= 8 times is a wildcard/default response
-            wildcard_keys = {k for k, count in cluster_counts.items() if count >= 8}
-            
-            # Also generic 301/308 redirects appearing >= 5 times
+            exact_wildcard_keys = {k for k, count in cluster_counts.items() if count >= 8}
+
             redirect_counts = Counter(e.get("status_code") for e in eps)
             mass_redirect = {sc for sc, count in redirect_counts.items() if sc in (301, 308) and count >= 5}
-            
-            for e in eps:
-                k = (e.get("content_length"), e.get("status_code"))
-                if k in wildcard_keys:
-                    wildcard_filtered += 1
-                    spa_detected = True
-                elif e.get("status_code") in mass_redirect:
-                    redirect_filtered += 1
-                    redirect_detected = True
-                else:
-                    final_kept.append(e)
-        else:
-            # Small origin with few endpoints: preserve them
-            final_kept.extend(eps)
 
-    # 3. Determine diagnostic reason if final_kept is empty
+            fuzzy_drop_indices, _ = _find_fuzzy_cluster_indices(eps)
+
+        for idx, e in enumerate(eps):
+            sc = e.get("status_code")
+            k = (e.get("content_length"), sc)
+            canary_reason = canary_map.get((orig, sc))
+
+            if canary_reason:
+                wildcard_filtered += 1
+                canary_filtered += 1
+                if canary_reason == "challenge":
+                    challenge_detected = True
+                else:
+                    spa_detected = True
+            elif k in exact_wildcard_keys:
+                wildcard_filtered += 1
+                spa_detected = True
+            elif idx in fuzzy_drop_indices:
+                wildcard_filtered += 1
+                fuzzy_wildcard_filtered += 1
+                challenge_detected = True
+            elif sc in mass_redirect:
+                redirect_filtered += 1
+                redirect_detected = True
+            else:
+                final_kept.append(e)
+
+    # 3. Determine human-readable diagnostic reason when filtered to zero
     diagnostic_reason = ""
     if not final_kept:
-        if spa_detected or wildcard_filtered > 0:
+        if challenge_detected:
+            diagnostic_reason = "الموقع محمي ببوابة تحدي مضادة للبوتات (Anti-Bot / JS Challenge) أو صفحة حظر ديناميكية تعيد استجابات متقاربة الطول للمسارات العشوائية؛ تم تصفية الاستجابات الوهمية لتجنب الإيجابيات الكاذبة."
+        elif spa_detected or wildcard_filtered > 0:
             diagnostic_reason = "الموقع يعتمد معمارية Single Page Application (SPA / Serverless)؛ تم الكشف الاستباقي عن آلية (SPA Fallback) وتصفية كافة الاستجابات الوهمية المتطابقة مع صفحة الواجهة. تم التأكد من عدم وجود أي واجهات API مكشوفة."
         elif redirect_detected or redirect_filtered > 0:
             diagnostic_reason = "تم فحص النطاقات وتصفية عمليات إعادة التوجيه العامة (308/301 Redirects) لعدم احتوائها على مسارات برمجية."
@@ -744,6 +1022,8 @@ def filter_spurious_api_endpoints(
         "initial_count": len(valid_endpoints),
         "root_path_filtered": root_filtered,
         "wildcard_filtered": wildcard_filtered,
+        "fuzzy_wildcard_filtered": fuzzy_wildcard_filtered,
+        "canary_filtered": canary_filtered,
         "redirect_filtered": redirect_filtered,
         "kept_count": len(final_kept)
     }
@@ -914,6 +1194,14 @@ def run_kiterunner_or_api_probing(
                         flush=True,
                     )
                     targets_for_scan = preferred
+                deduped_http = _dedup_followed_http_redirects(targets_for_scan, active_recs)
+                if deduped_http and len(deduped_http) < len(targets_for_scan):
+                    skipped_http = len(targets_for_scan) - len(deduped_http)
+                    print(
+                        f"[*] [Layer 1 HTTP->HTTPS] اختصار {skipped_http} رابط HTTP محول مسبقاً إلى HTTPS قبل تشغيل Kiterunner.",
+                        flush=True,
+                    )
+                    targets_for_scan = deduped_http
         except Exception:
             pass
 
@@ -1275,8 +1563,43 @@ def run_kiterunner_or_api_probing(
         f"Response invariant violation: responses={response_record_count} != valid={valid_count} + invalid_resp={invalid_response_count} + dup={duplicate_count}"
     )
 
-    # Heuristic smart filtering to eliminate spurious root paths, cPanel defaults, and SPA wildcard fallbacks
+    # Heuristic smart filtering to eliminate spurious root paths, cPanel defaults, and SPA wildcard / Anti-Bot challenge fallbacks
     filtered_endpoints, diagnostic_reason, filter_stats = filter_spurious_api_endpoints(valid_endpoints)
+
+    # Layer 3 (Negative Canary Probe): inspect smaller (>=3) or remaining dense (>=300B) uniform clusters
+    if filtered_endpoints:
+        suspects_by_origin_sc: Dict[Tuple[str, int], List[int]] = {}
+        for ep in filtered_endpoints:
+            orig = ep.get("origin")
+            sc = ep.get("status_code")
+            clen = ep.get("content_length")
+            if orig and isinstance(sc, int) and isinstance(clen, int) and clen >= 300:
+                suspects_by_origin_sc.setdefault((orig, sc), []).append(clen)
+
+        by_orig_codes: Dict[str, Tuple[Set[int], Dict[int, Tuple[int, int]]]] = {}
+        for (orig, sc), lens in suspects_by_origin_sc.items():
+            if len(lens) >= 3:
+                min_l, max_l = min(lens), max(lens)
+                avg_l = sum(lens) / len(lens)
+                if (max_l - min_l) <= max(500, int(0.05 * avg_l)):
+                    sc_set, bounds = by_orig_codes.setdefault(orig, (set(), {}))
+                    sc_set.add(sc)
+                    bounds[sc] = (min_l, max_l)
+
+        if by_orig_codes:
+            confirmed_canary_map: Dict[Tuple[str, int], str] = {}
+            for orig, (sc_set, bounds) in by_orig_codes.items():
+                canary_res = _check_origin_negative_canary_baseline(orig, sc_set, bounds)
+                if canary_res.get("confirmed_spurious"):
+                    reason_tag = "challenge" if canary_res.get("is_challenge") else "wildcard"
+                    for m_sc in canary_res.get("matched_status_codes") or sc_set:
+                        confirmed_canary_map[(orig, m_sc)] = reason_tag
+            if confirmed_canary_map:
+                filtered_endpoints, diagnostic_reason, filter_stats = filter_spurious_api_endpoints(
+                    valid_endpoints,
+                    confirmed_canary_origins=confirmed_canary_map,
+                )
+
     candidate_count = len(filtered_endpoints)
 
     # Prioritize primary entered target at top of output lists without fabricating new URLs
