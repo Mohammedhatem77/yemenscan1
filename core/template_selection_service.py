@@ -187,6 +187,8 @@ class TemplateRecord:
     official_exclusion_matches: List[str]
     policy_version: str
     indexed_at: Optional[str] = None
+    engine_validation_status: Optional[str] = None
+    engine_validation_reason: Optional[str] = None
 
 
 @dataclass
@@ -1559,6 +1561,7 @@ class TemplateSelectionService:
             or exec_reqs.get("required_variables", [])
             or []
         )
+        ev = policy.get("engine_validation") if isinstance(policy.get("engine_validation"), dict) else {}
 
         return TemplateRecord(
             id=str(row.id),
@@ -1588,6 +1591,8 @@ class TemplateSelectionService:
             official_exclusion_matches=policy.get("official_exclusion_matches") or [],
             policy_version=policy.get("policy_version", "unknown"),
             indexed_at=policy.get("indexed_at"),
+            engine_validation_status=ev.get("status"),
+            engine_validation_reason=ev.get("reason"),
         )
 
 
@@ -1666,6 +1671,8 @@ class TemplateSelectionService:
 #   official_exclusion_matches: string[];
 #   policy_version: string;
 #   indexed_at?: string | null;     // UTC ISO-8601 stored in policy_details JSONB
+#   engine_validation_status?: "validated" | "rejected" | "pending" | null;
+#   engine_validation_reason?: string | null;
 # }
 #
 # interface ValidationRequest {
