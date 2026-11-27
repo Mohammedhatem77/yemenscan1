@@ -22,6 +22,12 @@ NUCLEI_TEMPLATES_OFFICIAL_DIR = os.path.join(BASE_DIR, "nuclei_templates_officia
 NUCLEI_RUNTIME_TEMPLATES_DIR = os.path.join(BASE_DIR, "nuclei_runtime_templates")
 NUCLEI_RUNTIME_MANIFEST_PATH = os.path.join(BASE_DIR, "nuclei_runtime_manifest.json")
 
+# Versioned Immutable Snapshot Storage Structure
+NUCLEI_STORAGE_DIR = os.path.join(BASE_DIR, "storage", "nuclei")
+NUCLEI_VERSIONS_DIR = os.path.join(NUCLEI_STORAGE_DIR, "versions")
+NUCLEI_STAGING_DIR = os.path.join(NUCLEI_STORAGE_DIR, "staging")
+NUCLEI_OFFICIAL_REPO_URL = "https://github.com/projectdiscovery/nuclei-templates.git"
+
 # Pinned Container Image and Versioning Identifiers
 NUCLEI_DOCKER_IMAGE = "projectdiscovery/nuclei:v3.11.1@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb"
 NUCLEI_ENGINE_VERSION = "v3.11.1"

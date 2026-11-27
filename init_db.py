@@ -30,6 +30,8 @@ from models import (
     VulnerabilityFindings,
     AIReports,
     SystemSettings,
+    TemplateRepositoryVersion,
+    NucleiTemplate,
 )
 from core.db_service import (
     ingest_scan_from_directory,
@@ -43,6 +45,90 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("yemenscan.init_db")
+
+
+def _migrate_nuclei_templates_to_17_columns_pg(conn) -> None:
+    """
+    Preserves nuclei_templates.created_at inside policy_details.indexed_at
+    before removing the extra 18th column to match the approved 17-column design.
+    """
+    has_created_at = conn.execute(text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() "
+        "AND table_name = 'nuclei_templates' "
+        "AND column_name = 'created_at'"
+    )).scalar()
+    if not has_created_at:
+        return
+
+    # Copy created_at into policy_details JSONB before any DDL drop
+    conn.execute(text(
+        "UPDATE nuclei_templates "
+        "SET policy_details = jsonb_set("
+        "    COALESCE(policy_details, '{}'::jsonb), "
+        "    '{indexed_at}', "
+        "    to_jsonb(created_at), "
+        "    true"
+        ") "
+        "WHERE created_at IS NOT NULL "
+        "AND NOT (COALESCE(policy_details, '{}'::jsonb) ? 'indexed_at')"
+    ))
+
+    unpreserved = conn.execute(text(
+        "SELECT COUNT(*) FROM nuclei_templates "
+        "WHERE created_at IS NOT NULL "
+        "AND NOT (COALESCE(policy_details, '{}'::jsonb) ? 'indexed_at')"
+    )).scalar_one()
+    if unpreserved != 0:
+        raise RuntimeError(
+            f"Aborting nuclei_templates 17-column migration: {unpreserved} rows unpreserved"
+        )
+
+    conn.execute(text("ALTER TABLE nuclei_templates DROP COLUMN created_at;"))
+    logger.info("Preserved created_at into policy_details.indexed_at and aligned nuclei_templates to 17 columns.")
+
+
+def rollback_nuclei_templates_created_at_pg(conn) -> None:
+    """Reversible rollback helper: restores nuclei_templates.created_at from policy_details.indexed_at."""
+    conn.execute(text(
+        "ALTER TABLE nuclei_templates "
+        "ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE;"
+    ))
+    conn.execute(text(
+        "UPDATE nuclei_templates "
+        "SET created_at = COALESCE((policy_details->>'indexed_at')::timestamptz, NOW()) "
+        "WHERE created_at IS NULL;"
+    ))
+    conn.execute(text(
+        "ALTER TABLE nuclei_templates "
+        "ALTER COLUMN created_at SET NOT NULL, "
+        "ALTER COLUMN created_at SET DEFAULT NOW();"
+    ))
+
+
+def _migrate_nuclei_templates_to_17_columns_sqlite(conn) -> None:
+    """SQLite helper: preserves created_at inside policy_details.indexed_at and drops extra column."""
+    cols = [row[1] for row in conn.execute(text("PRAGMA table_info(nuclei_templates);")).fetchall()]
+    if "created_at" not in cols:
+        return
+
+    conn.execute(text(
+        "UPDATE nuclei_templates "
+        "SET policy_details = json_set(COALESCE(policy_details, '{}'), '$.indexed_at', created_at) "
+        "WHERE created_at IS NOT NULL "
+        "AND json_extract(COALESCE(policy_details, '{}'), '$.indexed_at') IS NULL"
+    ))
+    unpreserved = conn.execute(text(
+        "SELECT COUNT(*) FROM nuclei_templates "
+        "WHERE created_at IS NOT NULL "
+        "AND json_extract(COALESCE(policy_details, '{}'), '$.indexed_at') IS NULL"
+    )).scalar_one()
+    if unpreserved != 0:
+        raise RuntimeError(
+            f"Aborting SQLite nuclei_templates 17-column migration: {unpreserved} rows unpreserved"
+        )
+
+    conn.execute(text("ALTER TABLE nuclei_templates DROP COLUMN created_at;"))
 
 
 def migrate_schema() -> bool:
@@ -78,6 +164,57 @@ def migrate_schema() -> bool:
             # AIReports
             "ALTER TABLE ai_reports ADD COLUMN IF NOT EXISTS model_used VARCHAR(100);",
             "ALTER TABLE ai_reports ADD COLUMN IF NOT EXISTS report_metadata JSONB;",
+            # TemplateRepositoryVersions
+            """CREATE TABLE IF NOT EXISTS template_repository_versions (
+                id VARCHAR(36) PRIMARY KEY,
+                upstream_version VARCHAR(50) NOT NULL,
+                upstream_commit VARCHAR(64) NOT NULL,
+                repository_path VARCHAR(500) NOT NULL,
+                snapshot_hash VARCHAR(64) NOT NULL,
+                policy_version VARCHAR(50),
+                status VARCHAR(20) NOT NULL DEFAULT 'staging' CHECK (status IN ('staging', 'active', 'retained', 'failed')),
+                error_message TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+                published_at TIMESTAMP WITH TIME ZONE
+            );""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_template_repo_single_active ON template_repository_versions (status) WHERE status = 'active';",
+            "CREATE INDEX IF NOT EXISTS ix_template_repo_version_commit ON template_repository_versions (upstream_commit);",
+            "CREATE INDEX IF NOT EXISTS ix_template_repo_version_hash ON template_repository_versions (snapshot_hash);",
+            # NucleiTemplates Catalog
+            """CREATE TABLE IF NOT EXISTS nuclei_templates (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                repository_version_id VARCHAR(36) NOT NULL REFERENCES template_repository_versions(id) ON DELETE RESTRICT,
+                template_id VARCHAR(255) NOT NULL,
+                name VARCHAR(500),
+                description TEXT,
+                severity VARCHAR(20) NOT NULL DEFAULT 'unknown' CHECK (severity IN ('info', 'low', 'medium', 'high', 'critical', 'unknown')),
+                tags VARCHAR[] NOT NULL DEFAULT '{}',
+                protocols VARCHAR[] NOT NULL DEFAULT '{}',
+                cve_ids VARCHAR[] NOT NULL DEFAULT '{}',
+                cwe_ids VARCHAR[] NOT NULL DEFAULT '{}',
+                relative_path VARCHAR(500) NOT NULL,
+                content_hash VARCHAR(64) NOT NULL CHECK (length(content_hash) = 64 AND content_hash ~ '^[0-9a-fA-F]{64}$'),
+                security_status VARCHAR(20) NOT NULL DEFAULT 'ineligible' CHECK (security_status IN ('eligible', 'ineligible', 'conditional')),
+                sequential_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+                independent_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                policy_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                CONSTRAINT ck_nuclei_templates_ineligible_execution CHECK ((security_status = 'eligible') OR (sequential_eligible = FALSE AND independent_eligible = FALSE)),
+                CONSTRAINT ck_nuclei_templates_path_safety CHECK (relative_path NOT LIKE '/%' AND relative_path NOT LIKE '\\%' AND relative_path NOT LIKE '..%' AND relative_path NOT LIKE '%/..%' AND relative_path NOT LIKE '%\\..%'),
+                CONSTRAINT uq_nuclei_templates_repo_tid UNIQUE (repository_version_id, template_id),
+                CONSTRAINT uq_nuclei_templates_repo_path UNIQUE (repository_version_id, relative_path)
+            );""",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_id ON nuclei_templates (repository_version_id);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_template_id ON nuclei_templates (template_id);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_severity ON nuclei_templates (severity);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_sev ON nuclei_templates (repository_version_id, severity);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_status ON nuclei_templates (repository_version_id, security_status);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_tags_gin ON nuclei_templates USING gin (tags);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_protocols_gin ON nuclei_templates USING gin (protocols);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_cve_ids_gin ON nuclei_templates USING gin (cve_ids);",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_name_fts ON nuclei_templates USING gin (to_tsvector('english', COALESCE(name, '')));",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_seq_eligible ON nuclei_templates (repository_version_id) WHERE sequential_eligible = TRUE;",
+            "CREATE INDEX IF NOT EXISTS ix_nuclei_templates_ind_eligible ON nuclei_templates (repository_version_id) WHERE independent_eligible = TRUE;",
             # Performance Indexes
             "CREATE INDEX IF NOT EXISTS ix_vulnerability_findings_source ON vulnerability_findings (source);",
             "CREATE INDEX IF NOT EXISTS ix_assets_asset_type ON assets (asset_type);",
@@ -98,6 +235,7 @@ def migrate_schema() -> bool:
                     conn.execute(text(stmt))
                 except Exception as ex:
                     logger.warning("Migration statement note: %s (%s)", stmt.strip(), ex)
+            _migrate_nuclei_templates_to_17_columns_pg(conn)
 
         logger.info("PostgreSQL schema migration completed successfully.")
         return True
@@ -143,6 +281,67 @@ def migrate_schema() -> bool:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type};"))
                 except Exception as ex:
                     logger.warning("SQLite migration note for %s.%s: %s", table, col_name, ex)
+
+            # Ensure template_repository_versions and partial unique index exist in SQLite
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS template_repository_versions (
+                        id VARCHAR(36) PRIMARY KEY,
+                        upstream_version VARCHAR(50) NOT NULL,
+                        upstream_commit VARCHAR(64) NOT NULL,
+                        repository_path VARCHAR(500) NOT NULL,
+                        snapshot_hash VARCHAR(64) NOT NULL,
+                        policy_version VARCHAR(50),
+                        status VARCHAR(20) NOT NULL DEFAULT 'staging' CHECK (status IN ('staging', 'active', 'retained', 'failed')),
+                        error_message TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                        published_at TIMESTAMP
+                    );
+                """))
+                conn.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_template_repo_single_active
+                    ON template_repository_versions (status) WHERE status = 'active';
+                """))
+            except Exception as ex:
+                logger.warning("SQLite migration note for template_repository_versions: %s", ex)
+
+            # Ensure nuclei_templates exists in SQLite
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS nuclei_templates (
+                        id VARCHAR(36) PRIMARY KEY,
+                        repository_version_id VARCHAR(36) NOT NULL REFERENCES template_repository_versions(id) ON DELETE RESTRICT,
+                        template_id VARCHAR(255) NOT NULL,
+                        name VARCHAR(500),
+                        description TEXT,
+                        severity VARCHAR(20) NOT NULL DEFAULT 'unknown' CHECK (severity IN ('info', 'low', 'medium', 'high', 'critical', 'unknown')),
+                        tags JSON NOT NULL DEFAULT '[]',
+                        protocols JSON NOT NULL DEFAULT '[]',
+                        cve_ids JSON NOT NULL DEFAULT '[]',
+                        cwe_ids JSON NOT NULL DEFAULT '[]',
+                        relative_path VARCHAR(500) NOT NULL,
+                        content_hash VARCHAR(64) NOT NULL,
+                        security_status VARCHAR(20) NOT NULL DEFAULT 'ineligible' CHECK (security_status IN ('eligible', 'ineligible', 'conditional')),
+                        sequential_eligible BOOLEAN NOT NULL DEFAULT 0,
+                        independent_eligible BOOLEAN NOT NULL DEFAULT 0,
+                        metadata JSON NOT NULL DEFAULT '{}',
+                        policy_details JSON NOT NULL DEFAULT '{}',
+                        CONSTRAINT ck_nuclei_templates_ineligible_execution CHECK ((security_status = 'eligible') OR (sequential_eligible = 0 AND independent_eligible = 0)),
+                        CONSTRAINT uq_nuclei_templates_repo_tid UNIQUE (repository_version_id, template_id),
+                        CONSTRAINT uq_nuclei_templates_repo_path UNIQUE (repository_version_id, relative_path)
+                    );
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_id ON nuclei_templates (repository_version_id);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_template_id ON nuclei_templates (template_id);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_severity ON nuclei_templates (severity);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_sev ON nuclei_templates (repository_version_id, severity);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_repo_status ON nuclei_templates (repository_version_id, security_status);"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_seq_eligible ON nuclei_templates (repository_version_id) WHERE sequential_eligible = 1;"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_nuclei_templates_ind_eligible ON nuclei_templates (repository_version_id) WHERE independent_eligible = 1;"))
+                _migrate_nuclei_templates_to_17_columns_sqlite(conn)
+            except Exception as ex:
+                logger.warning("SQLite migration note for nuclei_templates: %s", ex)
+                logger.warning("SQLite template_repository_versions migration note: %s", ex)
 
         logger.info("SQLite schema migration completed successfully.")
         return True
