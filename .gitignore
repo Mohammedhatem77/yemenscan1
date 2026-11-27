@@ -5,7 +5,10 @@ scans/
 *.log
 nuclei_templates_official/
 nuclei_runtime_templates/
+storage/
 scratch/
+# Service-specific repository locks
+storage/nuclei/*.lock
 
 # Database files
 *.db

@@ -30,6 +30,7 @@ from models import (
     VulnerabilityFindings,
     AIReports,
     SystemSettings,
+    TemplateRepositoryVersion,
 )
 from core.db_service import (
     ingest_scan_from_directory,
@@ -76,6 +77,22 @@ def migrate_schema() -> bool:
             # AIReports
             "ALTER TABLE ai_reports ADD COLUMN IF NOT EXISTS model_used VARCHAR(100);",
             "ALTER TABLE ai_reports ADD COLUMN IF NOT EXISTS report_metadata JSONB;",
+            # TemplateRepositoryVersions
+            """CREATE TABLE IF NOT EXISTS template_repository_versions (
+                id VARCHAR(36) PRIMARY KEY,
+                upstream_version VARCHAR(50) NOT NULL,
+                upstream_commit VARCHAR(64) NOT NULL,
+                repository_path VARCHAR(500) NOT NULL,
+                snapshot_hash VARCHAR(64) NOT NULL,
+                policy_version VARCHAR(50),
+                status VARCHAR(20) NOT NULL DEFAULT 'staging' CHECK (status IN ('staging', 'active', 'retained', 'failed')),
+                error_message TEXT,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+                published_at TIMESTAMP WITH TIME ZONE
+            );""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_template_repo_single_active ON template_repository_versions (status) WHERE status = 'active';",
+            "CREATE INDEX IF NOT EXISTS ix_template_repo_version_commit ON template_repository_versions (upstream_commit);",
+            "CREATE INDEX IF NOT EXISTS ix_template_repo_version_hash ON template_repository_versions (snapshot_hash);",
             # Performance Indexes
             "CREATE INDEX IF NOT EXISTS ix_vulnerability_findings_source ON vulnerability_findings (source);",
             "CREATE INDEX IF NOT EXISTS ix_assets_asset_type ON assets (asset_type);",
@@ -139,6 +156,29 @@ def migrate_schema() -> bool:
                         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type};"))
                 except Exception as ex:
                     logger.warning("SQLite migration note for %s.%s: %s", table, col_name, ex)
+
+            # Ensure template_repository_versions and partial unique index exist in SQLite
+            try:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS template_repository_versions (
+                        id VARCHAR(36) PRIMARY KEY,
+                        upstream_version VARCHAR(50) NOT NULL,
+                        upstream_commit VARCHAR(64) NOT NULL,
+                        repository_path VARCHAR(500) NOT NULL,
+                        snapshot_hash VARCHAR(64) NOT NULL,
+                        policy_version VARCHAR(50),
+                        status VARCHAR(20) NOT NULL DEFAULT 'staging' CHECK (status IN ('staging', 'active', 'retained', 'failed')),
+                        error_message TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                        published_at TIMESTAMP
+                    );
+                """))
+                conn.execute(text("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_template_repo_single_active
+                    ON template_repository_versions (status) WHERE status = 'active';
+                """))
+            except Exception as ex:
+                logger.warning("SQLite template_repository_versions migration note: %s", ex)
 
         logger.info("SQLite schema migration completed successfully.")
         return True

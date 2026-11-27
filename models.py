@@ -16,6 +16,7 @@ from models.scan import (
     JSON_TYPE,
     utc_now,
 )
+from models.template_repository import TemplateRepositoryVersion
 
 __all__ = [
     "User",
@@ -27,6 +28,7 @@ __all__ = [
     "VulnerabilityFindings",
     "AIReports",
     "SystemSettings",
+    "TemplateRepositoryVersion",
     "JSON_TYPE",
     "utc_now",
 ]
