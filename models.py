@@ -17,6 +17,7 @@ from models.scan import (
     utc_now,
 )
 from models.template_repository import TemplateRepositoryVersion
+from models.template_catalog import NucleiTemplate
 
 __all__ = [
     "User",
@@ -29,6 +30,7 @@ __all__ = [
     "AIReports",
     "SystemSettings",
     "TemplateRepositoryVersion",
+    "NucleiTemplate",
     "JSON_TYPE",
     "utc_now",
 ]
