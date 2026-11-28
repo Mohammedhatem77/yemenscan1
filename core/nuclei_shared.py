@@ -36,6 +36,18 @@ NUCLEI_TEMPLATES_VERSION = "v10.5.1"
 NUCLEI_TEMPLATES_COMMIT = "79fb682760ab3d5b0e22afbb44709353cbebf023"
 NUCLEI_TEMPLATES_CHECKSUM = "8a8a34ea672e2ee3674092112e5e6934309fc9aa"
 
+# Hardened Headless Browser Execution Defaults (Phase 7.2.1)
+NUCLEI_HEADLESS_SECCOMP_PROFILE = os.path.join(BASE_DIR, "core", "security", "nuclei_headless_seccomp.json")
+NUCLEI_HEADLESS_BROWSER_PATH = "/usr/bin/chromium"
+NUCLEI_HEADLESS_UID_GID = "65534:65534"
+NUCLEI_HEADLESS_SHM_SIZE = "1g"
+NUCLEI_HEADLESS_MIN_SHM_BYTES = 512 * 1024 * 1024
+NUCLEI_HEADLESS_TMPFS_SPEC = "/tmp:rw,nosuid,nodev,noexec,size=512m"
+NUCLEI_HEADLESS_MEMORY_LIMIT = "1536m"
+NUCLEI_HEADLESS_PIDS_LIMIT = 256
+NUCLEI_HEADLESS_CDP_HOST = "127.0.0.1"
+NUCLEI_HEADLESS_CDP_PORT = 9222
+
 # Safe default CLI flags for Nuclei
 NUCLEI_SAFE_FLAGS: List[str] = [
     "-severity", "medium,high,critical",

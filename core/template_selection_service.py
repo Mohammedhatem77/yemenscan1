@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -314,6 +315,47 @@ class EnvironmentCapabilities:
     variables_provided: Dict[str, str] = field(default_factory=dict)
     dast_inputs_available: bool = False
     authorized_scopes: List[str] = field(default_factory=list)
+    headless_server_verified: bool = False
+    headless_blocking_reasons: List[str] = field(default_factory=list)
+    dast_input_context: Optional[Any] = None
+
+    @classmethod
+    def from_server_and_user_input(
+        cls,
+        headless_report: Any,
+        user_payload: Optional[Dict[str, Any]] = None,
+        authorized_scopes: Optional[List[str]] = None,
+        variables_provided: Optional[Dict[str, str]] = None,
+        auth_credentials_provided: bool = False,
+        interactsh_available: bool = False,
+        dast_inputs_available: bool = False,
+        dast_input_context: Optional[Any] = None,
+    ) -> "EnvironmentCapabilities":
+        """
+        Construct EnvironmentCapabilities trusting ONLY server verification
+        for `headless_available` (user input may opt-out via `allow_headless=False`,
+        but CANNOT force `headless_available=True` when server check fails).
+        """
+        payload = user_payload if isinstance(user_payload, dict) else {}
+        server_ready = bool(getattr(headless_report, "ready", False))
+        # User can only disable headless if they choose to; never enable unverified headless.
+        user_allows_headless = bool(payload.get("allow_headless", True))
+        effective_dast_flag = (
+            bool(dast_input_context.has_any_inputs)
+            if dast_input_context is not None
+            else bool(dast_inputs_available)
+        )
+        return cls(
+            headless_available=server_ready and user_allows_headless,
+            interactsh_available=interactsh_available,
+            auth_credentials_provided=auth_credentials_provided,
+            variables_provided=dict(variables_provided or {}),
+            dast_inputs_available=effective_dast_flag,
+            authorized_scopes=list(authorized_scopes or []),
+            headless_server_verified=True,
+            headless_blocking_reasons=list(getattr(headless_report, "blocking_reasons", []) or []),
+            dast_input_context=dast_input_context,
+        )
 
 
 @dataclass
@@ -343,6 +385,10 @@ class TargetReadinessEvaluation:
     out_of_scope_count: int
     readiness_breakdown: Dict[str, int]
     templates: List[TemplateReadinessStatus]
+    server_headless_verified: bool = False
+    headless_blocking_reasons: List[str] = field(default_factory=list)
+    dast_input_summary: Optional[Dict[str, Any]] = None
+    dast_detailed_breakdown: Dict[str, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -357,13 +403,63 @@ class TemplateSelectionService:
     Thread-safe (each call creates/uses its own session scope).
     """
 
-    def __init__(self, session: Optional[Session] = None):
+    def __init__(
+        self,
+        session: Optional[Session] = None,
+        headless_readiness_service: Optional[Any] = None,
+    ):
         """
         Args:
             session: Optional externally-managed SQLAlchemy session.
                      If None, each method creates and closes its own session.
+            headless_readiness_service: Optional HeadlessReadinessService used to
+                     enforce real server-side Headless browser verification.
         """
         self._ext_session = session
+        self._headless_readiness_service = headless_readiness_service
+
+    def get_headless_readiness(self, force_refresh: bool = False) -> Any:
+        """Query server-side Headless browser readiness (never trusts caller booleans)."""
+        if self._headless_readiness_service is None:
+            from core.headless_readiness import HeadlessReadinessService
+            self._headless_readiness_service = HeadlessReadinessService()
+        return self._headless_readiness_service.check_readiness(force_refresh=force_refresh)
+
+    def build_verified_environment_capabilities(
+        self,
+        base_caps: Optional[EnvironmentCapabilities] = None,
+        force_refresh: bool = False,
+    ) -> EnvironmentCapabilities:
+        """
+        Enforce server-verified Headless readiness atop caller-supplied scope/variable
+        preferences. Caller `headless_available=True` is ignored unless server check passes.
+        """
+        report = self.get_headless_readiness(force_refresh=force_refresh)
+        server_ready = bool(getattr(report, "ready", False))
+        reasons = list(getattr(report, "blocking_reasons", []) or [])
+
+        if base_caps is None:
+            return EnvironmentCapabilities(
+                headless_available=server_ready,
+                headless_server_verified=True,
+                headless_blocking_reasons=reasons,
+            )
+
+        return EnvironmentCapabilities(
+            headless_available=server_ready and bool(base_caps.headless_available),
+            interactsh_available=base_caps.interactsh_available,
+            auth_credentials_provided=base_caps.auth_credentials_provided,
+            variables_provided=dict(base_caps.variables_provided or {}),
+            dast_inputs_available=(
+                bool(base_caps.dast_input_context.has_any_inputs)
+                if getattr(base_caps, "dast_input_context", None) is not None
+                else base_caps.dast_inputs_available
+            ),
+            authorized_scopes=list(base_caps.authorized_scopes or []),
+            headless_server_verified=True,
+            headless_blocking_reasons=reasons,
+            dast_input_context=getattr(base_caps, "dast_input_context", None),
+        )
 
     def _get_session(self) -> Tuple[Session, bool]:
         """Returns (session, owns_it). Caller must close if owns_it=True."""
@@ -1207,6 +1303,7 @@ class TemplateSelectionService:
         target: str,
         scan_mode: ScanMode = ScanMode.INDEPENDENT,
         environment_caps: Optional[EnvironmentCapabilities] = None,
+        verify_server_headless: bool = False,
     ) -> TargetReadinessEvaluation:
         """
         Evaluates candidate templates against a specific target and environment.
@@ -1216,8 +1313,15 @@ class TemplateSelectionService:
           2. Target Compatibility: Target format (URL vs Domain vs IP) and protocol match.
           3. Execution Readiness: Headless browser, OAST, credentials, custom variables, DAST input.
           4. Authorization and Scope: Scope check against authorized scopes list.
+
+        When `environment_caps` is omitted, `verify_server_headless=True`, or a
+        `headless_readiness_service` is bound to this instance, server-side Headless
+        readiness is enforced regardless of caller-supplied booleans.
         """
-        caps = environment_caps or EnvironmentCapabilities()
+        if environment_caps is None or verify_server_headless or self._headless_readiness_service is not None:
+            caps = self.build_verified_environment_capabilities(base_caps=environment_caps)
+        else:
+            caps = environment_caps
         clean_target = str(target).strip()
 
         # Classify target type
@@ -1231,6 +1335,26 @@ class TemplateSelectionService:
         # Fetch candidate template records
         db, owns = self._get_session()
         try:
+            ver_row = db.execute(
+                select(TemplateRepositoryVersion).where(
+                    TemplateRepositoryVersion.id == repository_version_id
+                )
+            ).scalar_one_or_none()
+            snap_dir = (
+                ver_row.repository_path
+                if ver_row and ver_row.repository_path and os.path.isdir(ver_row.repository_path)
+                else None
+            )
+
+            from core.dast_readiness import (
+                DastReadinessService,
+                evaluate_dast_template_inputs,
+                resolve_missing_dast_input_reason,
+            )
+            dast_service = DastReadinessService(snapshot_dir=snap_dir)
+            dast_ctx = getattr(caps, "dast_input_context", None)
+            dast_detailed_breakdown: Dict[str, int] = {}
+
             safe_ids = [t for t in template_ids if re.match(r'^[a-zA-Z0-9_\-./]+$', str(t))]
             rows = []
             if safe_ids:
@@ -1285,6 +1409,19 @@ class TemplateSelectionService:
 
                 # 4. Execution Readiness
                 exec_ready = True
+                is_dast_template = t.relative_path.startswith("dast/") or "dast" in t.tags
+                dast_req = None
+                effective_required_vars = t.requires_variables
+                if is_dast_template and (dast_ctx is not None or snap_dir is not None):
+                    dast_req = dast_service.inspect_template(
+                        template_id=t.template_id,
+                        relative_path=t.relative_path,
+                        protocols=t.protocols,
+                        tags=t.tags,
+                        policy_details=row.policy_details,
+                    )
+                    effective_required_vars = dast_req.external_required_variables
+
                 if t.requires_headless and not caps.headless_available:
                     exec_ready = False
                     blocking.append("headless_browser_unavailable")
@@ -1300,20 +1437,36 @@ class TemplateSelectionService:
                     blocking.append("auth_credentials_missing")
                     breakdown["missing_auth"] += 1
 
-                # Only non-builtin required variables count
-                if t.requires_variables:
-                    missing_vars = [v for v in t.requires_variables if v not in caps.variables_provided]
+                # Only truly external (non-builtin, non-template-defined) required variables count
+                if effective_required_vars:
+                    missing_vars = [v for v in effective_required_vars if v not in caps.variables_provided]
                     if missing_vars:
                         exec_ready = False
                         blocking.append(f"required_variables_missing:{missing_vars}")
                         breakdown["missing_variables"] += 1
 
-                # DAST endpoint input check: DAST injection templates require crawled inputs/endpoints
-                is_dast_template = t.relative_path.startswith("dast/") or "dast" in t.tags
-                if is_dast_template and not caps.dast_inputs_available:
-                    exec_ready = False
-                    blocking.append("dast_crawl_endpoints_unavailable")
-                    breakdown["missing_dast_inputs"] += 1
+                # DAST input readiness check: separates bare origins from parameterized/path/body/request inputs
+                if is_dast_template:
+                    if dast_ctx is not None and dast_req is not None:
+                        ok_dast, dast_reasons = evaluate_dast_template_inputs(dast_req, dast_ctx)
+                        if not ok_dast:
+                            exec_ready = False
+                            blocking.extend(dast_reasons)
+                            breakdown["missing_dast_inputs"] += 1
+                            for dr in dast_reasons:
+                                dast_detailed_breakdown[dr] = dast_detailed_breakdown.get(dr, 0) + 1
+                    elif not caps.dast_inputs_available:
+                        exec_ready = False
+                        fallback_reason = (
+                            resolve_missing_dast_input_reason(dast_req)
+                            if dast_req is not None
+                            else "dast_missing_request_inputs"
+                        )
+                        blocking.append(fallback_reason)
+                        breakdown["missing_dast_inputs"] += 1
+                        dast_detailed_breakdown[fallback_reason] = (
+                            dast_detailed_breakdown.get(fallback_reason, 0) + 1
+                        )
 
                 overall = is_eligible and is_in_scope and is_compat and exec_ready
 
@@ -1321,6 +1474,16 @@ class TemplateSelectionService:
                     ready_count += 1
                 elif is_eligible and is_in_scope and is_compat and not exec_ready:
                     compatible_not_ready += 1
+
+                req_exec_meta: Dict[str, Any] = {
+                    "headless": t.requires_headless,
+                    "interactsh": t.requires_interactsh,
+                    "authentication": t.requires_authentication,
+                    "required_variables": list(effective_required_vars),
+                    "is_dast": is_dast_template,
+                }
+                if dast_req is not None:
+                    req_exec_meta["dast_requirements"] = dast_req.to_dict()
 
                 evaluated_templates.append(
                     TemplateReadinessStatus(
@@ -1331,13 +1494,7 @@ class TemplateSelectionService:
                         in_scope=is_in_scope,
                         overall_ready=overall,
                         blocking_reasons=blocking,
-                        required_execution={
-                            "headless": t.requires_headless,
-                            "interactsh": t.requires_interactsh,
-                            "authentication": t.requires_authentication,
-                            "required_variables": t.requires_variables,
-                            "is_dast": is_dast_template,
-                        },
+                        required_execution=req_exec_meta,
                     )
                 )
 
@@ -1353,10 +1510,60 @@ class TemplateSelectionService:
                 out_of_scope_count=out_of_scope_count,
                 readiness_breakdown=breakdown,
                 templates=evaluated_templates,
+                server_headless_verified=caps.headless_server_verified,
+                headless_blocking_reasons=list(caps.headless_blocking_reasons or []),
+                dast_input_summary=dast_ctx.to_summary_dict() if dast_ctx is not None else None,
+                dast_detailed_breakdown=dast_detailed_breakdown,
             )
         finally:
             if owns:
                 db.close()
+
+    def evaluate_dast_suite_readiness(
+        self,
+        repository_version_id: str,
+        target: str,
+        dast_input_context: Any,
+        scan_mode: ScanMode = ScanMode.INDEPENDENT,
+        headless_available: Optional[bool] = None,
+        interactsh_available: bool = False,
+        authorized_scopes: Optional[List[str]] = None,
+    ) -> TargetReadinessEvaluation:
+        """
+        Evaluate readiness across ALL cataloged DAST templates for a target and
+        normalized `DastInputContext` without filtering or dropping unready rows.
+        """
+        db, owns = self._get_session()
+        try:
+            dast_rows = db.execute(
+                select(NucleiTemplate.template_id)
+                .where(
+                    NucleiTemplate.repository_version_id == repository_version_id,
+                    (NucleiTemplate.sequential_eligible == True) | (NucleiTemplate.independent_eligible == True),
+                    NucleiTemplate.relative_path.like("dast/%"),
+                )
+                .order_by(NucleiTemplate.relative_path.asc())
+            ).scalars().all()
+        finally:
+            if owns:
+                db.close()
+
+        verify_server = headless_available is None
+        caps = EnvironmentCapabilities(
+            headless_available=True if headless_available is None else bool(headless_available),
+            interactsh_available=interactsh_available,
+            dast_inputs_available=bool(dast_input_context.has_any_inputs),
+            authorized_scopes=list(authorized_scopes or []),
+            dast_input_context=dast_input_context,
+        )
+        return self.evaluate_target_and_readiness(
+            repository_version_id=repository_version_id,
+            template_ids=list(dast_rows),
+            target=target,
+            scan_mode=scan_mode,
+            environment_caps=caps,
+            verify_server_headless=verify_server,
+        )
 
     @staticmethod
     def _classify_target(target: str) -> Tuple[str, str]:
